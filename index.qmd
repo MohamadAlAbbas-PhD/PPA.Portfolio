@@ -1,0 +1,71 @@
+---
+title: "Background"
+---
+
+# Summary
+
+I am a PhD candidate in Demography and Sociology whose work centers on environmental demography, climate-related hazards, and population health. I bring a multidisciplinary background—grounded in Electrical and Computer Engineering and complemented by training in International Affairs—to research questions that require both technical rigor and policy relevance. Methodologically, I work at the intersection of spatial analytics, causal inference, and applied public policy, building reproducible pipelines that link remotely sensed climate surfaces (e.g., precipitation and temperature anomalies) with survey and administrative microdata.
+
+Substantively, I study how environmental shocks translate into unequal health and well-being outcomes, with particular attention to children under five and pregnant women, and to the social stratification that shapes exposure, disruption, and recovery. A recurring theme in my research is that administrative boundaries often obscure the underlying environmental processes that drive risk in low- and middle-income settings; accordingly, I emphasize exposure definitions based on ecological and climatic context rather than political borders. Across projects, my goal is to produce empirical work that is transparent, methodologically defensible, and directly legible to decision-makers—whether the audience is public health practitioners, planners, or researchers working on climate adaptation and resilience.
+
+[CV](cv.qmd) | [Publications](Publications.qmd)
+
+---
+
+# About Me
+
+I was born in Beirut, Lebanon, and that origin continues to shape how I think about inequality, risk, and the ways institutions and infrastructure structure everyday life. It’s also where my motivation comes from: I’m interested in research that explains who bears the costs of disruption—especially environmental disruption—and why those burdens are so uneven.
+
+My academic trajectory has not been linear, but it has been deliberately cumulative. I earned a Bachelor’s degree in Electrical and Computer Engineering, followed by a Master of Arts in International Affairs—training that grounded me in both technical problem-solving and the realities of policy, governance, and social systems. Today, I am pursuing a joint PhD in Demography and Sociology alongside a Master’s in Urban Spatial Analytics. That combination reflects how I work best: at the intersection of methods, context, and impact.
+
+My interdisciplinary approach is not a branding choice; it is a practical response to the problems I study. Climate and health processes do not respect administrative borders or disciplinary boundaries. A central theme in my recent work is that relying on administrative boundaries as controls in climate–health research can be misleading in low- and middle-income settings. Instead, I emphasize environmentally grounded definitions of exposure and context—linking satellite and geospatial measures to lived experiences and health outcomes, and treating “place” as a dynamic system rather than a line on a map.
+
+Outside of research, I maintain a diverse range of interests that keeps my work creative and grounded. I am energized by projects that demand both rigor and imagination—whether that means building reproducible analytical pipelines, mapping environmental exposure, or translating empirical findings into narratives that decision-makers can actually use.
+
+Because my path has crossed engineering, international affairs, demography, sociology, and spatial analytics, I’m confident in my ability to apply a multidisciplinary skillset in many settings—from international investigations to academia, and through to consulting. In each context, I bring the same core strengths: technical depth, methodological rigor, and a commitment to producing evidence that travels well—across places, disciplines, and real-world constraints.
+
+## Methods and technical skills
+
+I build reproducible, policy-relevant analytics workflows that link environmental exposures to population outcomes.
+
+### Spatial and exposure construction
+- Vector GIS: joins/overlays, buffers, nearest-neighbor, point-in-polygon
+- Raster: extraction, reprojection, anomaly metrics, lags/windows, mosaics
+- Integrating remotely sensed climate data with survey and administrative microdata
+
+### Modeling and interpretation
+- Regressions, interactions, fixed effects, robust specification checks
+- Predictive margins / marginal effects; clear visualization of heterogeneity
+- Causal workflows as appropriate: IV, mediation, DiD-style structures, sensitivity diagnostics
+
+### Tools and stack
+- **Languages:** R (primary), Stata, Python
+- **GIS:** ArcGIS Pro
+- **Reproducibility/Documentation:** Quarto / R Markdown; Git/GitHub
+- **Data formats:** CSV, GeoTIFF, NetCDF, Shapefile/GeoPackage
+- **Machine Learning:** NLP, RL, Neural Networks (CNN & RNN), Decision Trees  
+
+## Selected projects
+
+A curated selection of projects that reflect my methdological and technical skills. Each includes a short write-up and possible reproducible code.
+
+- **[Space-Time Predictions of Indego Bike Share Demand](./R_Projects/Assignment_5/assignment5.html)**  
+  Space–time prediction and evaluation with an emphasis on operationally meaningful model performance.
+
+- **[House Pricing Prediction – Technical Appendix](./R_Projects/midterm/appendix/Midterm_2025.html)**  
+  Methods-first technical reporting: assumptions, diagnostics, and reproducible workflow documentation.
+
+- **[Spatially & Temporally-Lagged Eviction Filings Prediction – Technical Appendix](./R_Projects/Final/final_challenge.html)**  
+  Capstone workflow integrating modeling, validation, and clear communication of results.
+
+- **[ArcGIS StoryMap: Lebanon Solar Panel Adoption (StoryMap)](https://storymaps.arcgis.com/stories/3d8987d329064940b62db4431ac9ac99)**  
+  Interactive ArcGIS StoryMaps project; narrative + maps and visual evidence supporting the analysis.
+
+---
+
+# Contact
+
+- [**Email**](mailto:ma96@upenn.edu)
+- [**GitHub**](https://github.com/MohamadAlAbbas-PhD)
+- [**LinkedIn**](https://www.linkedin.com/in/mohammadalabbas96)
+- [**Google Scholar**](https://scholar.google.com/citations?user=hpTT5-4AAAAJ&hl=en&oi=ao)

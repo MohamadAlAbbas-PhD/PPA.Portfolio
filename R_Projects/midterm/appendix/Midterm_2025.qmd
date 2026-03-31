@@ -1,0 +1,2151 @@
+---
+title: "Philadelphia Housing Price Prediction"
+subtitle: "Technical Appendix — Hedonic Modeling of Single-Family Home Sales"
+author: "Mohamad AlAbbas, Natan Anaqami, Jinheng Cen, Jed Chew & Henry Yang"
+date: today
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+::: {.callout-note appearance="minimal"}
+**Course:** MUSA 5080 — Geospatial Machine Learning for Urban Planning, University of Pennsylvania
+**Portfolio:** [mohamadalabbas-phd.github.io](https://mohamadalabbas-phd.github.io)
+**Summary:** Full technical appendix for a hedonic home price prediction model in Philadelphia. Covers spatial feature engineering (crime proximity, transit access, school quality, green space), OLS diagnostics, and cross-validated prediction accuracy across neighborhoods.
+:::
+
+**Content:** All the technical details:
+
+- Complete data cleaning code
+- All EDA visualizations
+- Feature engineering code
+- Full model outputs
+- Diagnostic plots
+- Detailed interpretations
+
+**Audience:** Data scientists and technical reviewers
+
+---
+
+## Data Sources
+
+### Primary Dataset: Philadelphia Property Sales
+
+**Source:** [Philadelphia Property Sales](https://metadata.phila.gov/#home/datasetdetails/5543865f20583086178c4ee5/representationdetails/55d624fdad35c7e854cb21a4/)
+
+We sourced the following variables from the property sales dataset: 
+
+- Sale price
+- Sale date
+- Property characteristics:
+  - Total Area
+  - Total Livable Area
+  - Year Built
+  - Census Tract
+  - Exterior Condition
+  - Interior Condition
+  - Fireplaces
+  - Garage Spaces
+  - Market Value
+  - Basements
+  - Number of Bedrooms
+  - Number of Bathrooms 
+  - Number of Stories
+  - Shape
+
+### Secondary Datasets: Spatial Amenities
+
+**Source:** [OpenDataPhilly](https://opendataphilly.org)
+
+We sourced the following environmental and neighborhood characteristics: 
+
+- [Crime Incidents](https://opendataphilly.org/datasets/crime-incidents/):
+- [Neighborood Boundaries](https://opendataphilly.org/datasets/philadelphia-neighborhoods/)
+- [SEPTA](https://opendataphilly.org/datasets/septa-routes-stops-locations/)
+- [Bike Network](https://opendataphilly.org/datasets/bike-network/)
+- [Hospital](https://opendataphilly.org/datasets/philadelphia-hospitals/)
+- [Philadelphia Park and Recreation](https://opendataphilly.org/datasets/ppr-properties/)
+- [Schools](https://opendataphilly.org/datasets/schools/)
+- [Neighborhood Food Markets](https://opendataphilly.org/datasets/neighborhood-food-retail/)
+- [Police Station](https://opendataphilly.org/datasets/police-stations/)
+- [Fire Department](https://opendataphilly.org/datasets/fire-department-facilities/ )
+
+
+
+---
+
+### Part 1: Data Preparation
+
+```{r}
+#| label: SETUP
+#| message: false
+#| warning: false
+#| include: false
+
+library(tidyverse)
+library(tidycensus)
+library(broom)
+library(janitor)
+library(sf)
+library(tigris)
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(units)
+library(knitr)
+library(caret)
+library(car)
+library(lubridate)
+library(stringr)
+library(ggcorrplot)
+library(fixest)
+library(modelsummary)
+library(patchwork)
+library(forcats)
+library(purrr)
+library(zoo)
+library(kableExtra)
+
+options(warn = -1)
+options(tigris_use_cache = TRUE)
+
+census_api_key("fe841b7ef0aa73d9579f0517bd1c8f26d33c789b", install = FALSE)
+
+CRS_TARGET <- 3365        # projected working CRS
+ACS_YEAR   <- 2023
+STATE_FIPS <- "42"
+GEOG       <- "tract"
+
+```
+
+```{r}
+#| label: themes
+
+# ── Visual Themes ─────────────────────────────────────────────────────────────
+plotTheme <- theme(
+  plot.title       = element_text(size = 14, face = "bold"),
+  plot.subtitle    = element_text(size = 11, color = "grey40"),
+  plot.caption     = element_text(size = 8,  color = "grey55", hjust = 1),
+  axis.text        = element_text(size = 9),
+  axis.title       = element_text(size = 10, face = "bold"),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "#fafafa", color = NA),
+  plot.background  = element_rect(fill = "white",   color = NA),
+  legend.title     = element_text(size = 9,  face = "bold"),
+  legend.text      = element_text(size = 8)
+)
+
+mapTheme <- theme_void() +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold"),
+    plot.subtitle   = element_text(size = 11, color = "grey40"),
+    plot.caption    = element_text(size = 8,  color = "grey55", hjust = 1),
+    legend.title    = element_text(size = 9,  face = "bold"),
+    legend.text     = element_text(size = 8),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+palette5 <- c("#f0f9e8", "#bae4bc", "#7bccc4", "#43a2ca", "#0868ac")
+
+```
+
+
+**Load and clean Philadelphia sales data:**
+
+```{r}
+#| label: LOAD-DATA
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+########################
+# REMOTE DATA SOURCES
+########################
+
+NEIGH_URL   <- "https://raw.githubusercontent.com/opendataphilly/open-geo-data/refs/heads/master/philadelphia-neighborhoods/philadelphia-neighborhoods.geojson"
+STOPS_URL   <- "https://hub.arcgis.com/api/v3/datasets/4f827cdbf84d4a53983cf43b8d9fd4df_0/downloads/data?format=geojson&spatialRefId=4326&where=1%3D1"
+BIKE_URL    <- "https://hub.arcgis.com/api/v3/datasets/b5f660b9f0f44ced915995b6d49f6385_0/downloads/data?format=geojson&spatialRefId=4326&where=1%3D1"
+HOSP_URL    <- "https://opendata.arcgis.com/datasets/df8dc18412494e5abbb021e2f33057b2_0.geojson"
+PARKS_URL   <- "https://hub.arcgis.com/api/v3/datasets/d52445160ab14380a673e5849203eb64_0/downloads/data?format=geojson&spatialRefId=4326&where=1%3D1"
+SCHOOLS_URL <- "https://hub.arcgis.com/api/v3/datasets/d46a7e59e2c246c891fbee778759717e_0/downloads/data?format=geojson&spatialRefId=4326&where=1%3D1"
+FOOD_URL    <- "https://opendata.arcgis.com/datasets/53b8a1c653a74c92b2de23a5d7bf04a0_0.geojson"
+POLICE_URL  <- "https://hub.arcgis.com/api/v3/datasets/7e522339d7c24e8ea5f2c7780291c315_0/downloads/data?format=geojson&spatialRefId=4326&where=1%3D1"
+FIRE_URL    <- "https://opendata.arcgis.com/datasets/341526186e014aa0aa3ef7e08a394a78_0.geojson"
+OPA_URL <- "https://opendata-downloads.s3.amazonaws.com/opa_properties_public.csv"
+CRIME_2023_URL <- "https://phl.carto.com/api/v2/sql?filename=incidents_part1_part2&format=csv&q=SELECT%20*%20,%20ST_Y(the_geom)%20AS%20lat,%20ST_X(the_geom)%20AS%20lng%20FROM%20incidents_part1_part2%20WHERE%20dispatch_date_time%20%3E=%20%272024-01-01%27%20AND%20dispatch_date_time%20%3C%20%272025-01-01%27"
+CRIME_2024_URL <- "https://phl.carto.com/api/v2/sql?filename=incidents_part1_part2&format=csv&q=SELECT%20*%20,%20ST_Y(the_geom)%20AS%20lat,%20ST_X(the_geom)%20AS%20lng%20FROM%20incidents_part1_part2%20WHERE%20dispatch_date_time%20%3E=%20%272023-01-01%27%20AND%20dispatch_date_time%20%3C%20%272024-01-01%27"
+
+############################################################
+# HELPERS
+############################################################
+
+norm_tgc <- function(x) x |> str_squish() |> str_to_lower()
+
+violent_set <- c(
+  "homicide - criminal",
+  "homicide - justifiable",
+  "rape",
+  "robbery firearm",
+  "robbery no firearm",
+  "aggravated assault firearm",
+  "aggravated assault no firearm",
+  "other assaults",
+  "offenses against family and children"
+)
+
+make_violence_bins <- function(df) {
+  df %>%
+    mutate(
+      key = norm_tgc(text_general_code),
+      gun_involved = str_detect(key, "firearm|weapon"),
+      violence_bin = case_when(
+        gun_involved         ~ "Violent",
+        key %in% violent_set ~ "Violent",
+        TRUE                 ~ "Misdemeanor/Non-violent"
+      ),
+      violence_bin = factor(
+        violence_bin,
+        levels = c("Violent", "Misdemeanor/Non-violent")
+      )
+    )
+}
+
+get_block_dists <- function(epsg, one_block_ft = 300) {
+  u <- tryCatch(st_crs(epsg)$units_gdal, error = function(e) NA_character_)
+  if (is.na(u)) u <- "unknown"
+  if (u %in% c("metre","m")) {
+    ft_to_m <- 0.3048
+    list(
+      one = one_block_ft * ft_to_m,
+      two = one_block_ft * 2 * ft_to_m
+    )
+  } else {
+    list(
+      one = one_block_ft,
+      two = one_block_ft * 2
+    )
+  }
+}
+
+to_feet <- function(x, units_gdal) {
+  if (isTRUE(units_gdal %in% c("metre","m"))) {
+    as.numeric(x) / 0.3048
+  } else {
+    as.numeric(x)
+  }
+}
+
+to_miles <- function(x, units_gdal) {
+  x_num <- as.numeric(x)
+  if (isTRUE(units_gdal %in% c("metre","m"))) {
+    x_num / 1609.344
+  } else {
+    x_num / 5280
+  }
+}
+
+nearest_dist_ft <- function(from_pts, to_feats, units_gdal) {
+  if (nrow(to_feats) == 0) return(rep(NA_real_, nrow(from_pts)))
+  idx <- st_nearest_feature(from_pts, to_feats)
+  d   <- st_distance(from_pts, to_feats[idx, ], by_element = TRUE)
+  to_feet(d, units_gdal)
+}
+
+norm_school_type <- function(x) {
+  t <- str_to_lower(str_squish(as.character(x)))
+  case_when(
+    str_detect(t, "charter")                 ~ "charter",
+    str_detect(t, "private|independent")     ~ "private",
+    str_detect(t, "public|district")         ~ "public",
+    TRUE                                     ~ NA_character_
+  )
+}
+
+############################################################
+# 1. LOAD REMOTE DATA
+############################################################
+
+Raw_data <- read_csv(OPA_URL, show_col_types = FALSE)
+
+crime2023 <- read_csv(CRIME_2023_URL, show_col_types = FALSE)
+crime2024 <- read_csv(CRIME_2024_URL, show_col_types = FALSE)
+
+# these will now come from URL instead of disk
+neigh_raw  <- read_sf(NEIGH_URL)
+stops_raw  <- read_sf(STOPS_URL)
+bike_raw   <- read_sf(BIKE_URL)
+hosp_raw   <- read_sf(HOSP_URL)
+parks_raw  <- read_sf(PARKS_URL)
+schools_in <- read_sf(SCHOOLS_URL)
+food_raw   <- read_sf(FOOD_URL)
+pol_raw    <- read_sf(POLICE_URL)
+fire_raw   <- read_sf(FIRE_URL)
+
+```
+
+
+```{r}
+#| label: Property-Sales
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+############################################################
+# 2. CLEAN PROPERTY SALES
+############################################################
+
+keep_vars <- c(
+  "sale_date", "sale_price",
+  "total_area", "total_livable_area",
+  "unfinished", "year_built", "shape",
+  "category_code", "category_code_description",
+  "census_tract", "central_air",
+  "exterior_condition", "interior_condition",
+  "fireplaces", "garage_spaces",
+  "general_construction", "market_value",
+  "number_of_bathrooms", "number_of_bedrooms",
+  "number_stories", "quality_grade",
+  "basements"
+)
+
+clean_data <- Raw_data %>%
+  select(any_of(keep_vars)) %>%
+  mutate(
+    # OPA sometimes sticks a leading integer before the date
+    sale_date_chr = sub("^\\s*\\d+\\s+", "", as.character(sale_date)),
+    sale_date = suppressWarnings(parse_date_time(
+      sale_date_chr,
+      orders = c("Y-m-d H:M:S", "Y-m-d"),
+      tz = "America/New_York"
+    ))
+  ) %>%
+  # time filter (2023-01-01 through 2024-12-31 basically)
+  filter(
+    !is.na(sale_date),
+    sale_date >= ymd_hms("2023-01-01 00:00:00", tz = "America/New_York"),
+    sale_date <  ymd_hms("2025-01-01 00:00:00", tz = "America/New_York")
+  ) %>%
+  # keep only residential code 1
+  mutate(category_code = suppressWarnings(as.integer(category_code))) %>%
+  filter(category_code == 1) %>%
+  select(-sale_date_chr)
+
+# drop rows with missing geometry before converting WKT
+clean_data <- clean_data %>% filter(!is.na(shape) & nchar(trimws(shape)) > 0)
+
+# turn WKT parcel geometry into sf polygons; OPA CRS is EPSG:2272
+clean_data <- st_as_sf(clean_data, wkt = "shape", crs = 2272)
+
+# NA summary (useful diagnostics)
+dat_no_geom <- st_drop_geometry(clean_data)
+n_rows <- nrow(dat_no_geom)
+na_summary <- dat_no_geom %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "na_count") %>%
+  mutate(na_pct = round(100 * na_count / n_rows, 2)) %>%
+  arrange(desc(na_count))
+
+# drop some bad cols and then drop rows w/ remaining NA
+clean_data <- clean_data %>%
+  select(-unfinished, -central_air)
+
+keep_rows <- stats::complete.cases(st_drop_geometry(clean_data))
+clean_data <- clean_data[keep_rows, ]
+
+
+```
+
+
+```{r}
+#| label: Spatial-Enrichment
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+############################################################
+# 3. SPATIAL ENRICHMENT
+############################################################
+
+crime2023_bins <- make_violence_bins(crime2023)
+crime2024_bins <- make_violence_bins(crime2024)
+
+crime_bins <- bind_rows(crime2023_bins, crime2024_bins) %>%
+  filter(!is.na(lng), !is.na(lat)) %>%
+  st_as_sf(coords = c("lng","lat"), crs = 4326, remove = FALSE) %>%
+  st_transform(CRS_TARGET)
+
+crime_violent <- filter(crime_bins, violence_bin == "Violent")
+crime_petty   <- filter(crime_bins, violence_bin == "Misdemeanor/Non-violent")
+
+# project parcels, ensure valid geom, attach an ID
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid() %>%
+  mutate(prop_id = row_number())
+
+# create centroids for distance/buffer ops
+props_centroids <- st_centroid(clean_data)[, "prop_id"]
+
+# make ~1 block (~300ft) and ~2 blocks (~600ft) buffers
+BLK <- get_block_dists(CRS_TARGET, one_block_ft = 300)
+buf_1blk <- st_buffer(props_centroids, BLK$one)[, "prop_id"]
+buf_2blk <- st_buffer(props_centroids, BLK$two)[, "prop_id"]
+
+# track all IDs so every parcel gets a value
+prop_id_tbl <- st_drop_geometry(props_centroids) %>% select(prop_id)
+
+violent_counts <- st_join(buf_2blk, crime_violent, join = st_intersects, left = TRUE) %>%
+  st_drop_geometry() %>%
+  group_by(prop_id) %>%
+  summarise(violent_2blocks = sum(!is.na(lat)), .groups = "drop") %>%
+  right_join(prop_id_tbl, by = "prop_id") %>%
+  mutate(violent_2blocks = coalesce(violent_2blocks, 0L))
+
+petty_counts <- st_join(buf_1blk, crime_petty, join = st_intersects, left = TRUE) %>%
+  st_drop_geometry() %>%
+  group_by(prop_id) %>%
+  summarise(petty_1block = sum(!is.na(lat)), .groups = "drop") %>%
+  right_join(prop_id_tbl, by = "prop_id") %>%
+  mutate(petty_1block = coalesce(petty_1block, 0L))
+
+clean_data <- clean_data %>%
+  left_join(violent_counts, by = "prop_id") %>%
+  left_join(petty_counts,  by = "prop_id")
+
+
+### 3b. Neighborhood join
+
+candidate_cols <- c(
+  "name","neighborhood","neighborhood_name","mapname",
+  "map_name","label","area_name","neigh_name","NAME","LABEL"
+)
+hit <- intersect(candidate_cols, names(neigh_raw))
+NEIGH_NAME_COL <- if (length(hit) >= 1) hit[1] else {
+  stop("Couldn't find a neighborhood name column in neigh_raw.")
+}
+
+neigh <- neigh_raw %>%
+  st_make_valid() %>%
+  st_transform(CRS_TARGET) %>%
+  select(neigh_name = !!sym(NEIGH_NAME_COL))
+
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+props_with_neigh <- st_join(props_ctr, neigh, join = st_within, left = TRUE)
+
+clean_data <- clean_data %>%
+  left_join(
+    st_drop_geometry(props_with_neigh) %>% select(prop_id, neigh_name),
+    by = "prop_id"
+  )
+
+
+### 3c. Transit access
+
+stops <- stops_raw %>%
+  st_make_valid() %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+# recompute props_ctr just in case
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid() %>%
+  mutate(prop_id = coalesce(prop_id, row_number()))
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+nn_idx <- st_nearest_feature(props_ctr, stops)
+nearest_stops <- stops[nn_idx, ]
+dist_vec <- st_distance(props_ctr, nearest_stops, by_element = TRUE)
+
+crs_units <- tryCatch(st_crs(CRS_TARGET)$units_gdal, error = function(e) NA_character_)
+dist_stop_ft <- to_feet(dist_vec, crs_units)
+
+cand <- c("stop_name","name","STOP_NAME","stop_id","id","STOP_ID")
+hit  <- intersect(cand, names(stops))
+stop_id_col <- if (length(hit) >= 1) hit[1] else NA_character_
+
+nearest_tbl <- st_drop_geometry(nearest_stops) %>%
+  mutate(
+    prop_id = props_ctr$prop_id,
+    dist_stop_ft = dist_stop_ft
+  ) %>%
+  { if (!is.na(stop_id_col)) {
+      select(., prop_id, dist_stop_ft,
+             nearest_stop = !!sym(stop_id_col))
+    } else {
+      select(., prop_id, dist_stop_ft)
+    }
+  }
+
+clean_data <- clean_data %>%
+  left_join(nearest_tbl, by = "prop_id")
+
+
+### 3d. Bike network access
+
+# turn polygons into boundaries if needed (so distance-to-line makes sense)
+types <- unique(st_geometry_type(bike_raw))
+bike_geom <- st_geometry(bike_raw)
+if (any(grepl("POLYGON", types))) {
+  bike_geom <- st_boundary(bike_geom)
+}
+
+bike <- bike_raw %>%
+  st_set_geometry(bike_geom) %>%
+  st_cast("MULTILINESTRING", warn = FALSE) %>%
+  st_make_valid() %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid()
+
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+nn_idx <- st_nearest_feature(props_ctr, bike)
+nearest_bike <- bike[nn_idx, ]
+dist_vec <- st_distance(props_ctr, nearest_bike, by_element = TRUE)
+dist_bike_ft <- to_feet(dist_vec, crs_units)
+
+cand <- c("name","route","route_name","facility","type","street","NAME","ROUTE")
+hit  <- intersect(cand, names(bike))
+bike_col <- if (length(hit) >= 1) hit[1] else NA_character_
+
+nearest_tbl <- st_drop_geometry(nearest_bike) %>%
+  mutate(
+    prop_id       = props_ctr$prop_id,
+    dist_bike_ft  = dist_bike_ft
+  ) %>%
+  { if (!is.na(bike_col)) {
+      select(., prop_id, dist_bike_ft,
+             nearest_bike_feature = !!sym(bike_col))
+    } else {
+      select(., prop_id, dist_bike_ft)
+    }
+  }
+
+clean_data <- clean_data %>%
+  left_join(nearest_tbl, by = "prop_id")
+
+
+### 3e. Hospital access
+
+hosp <- hosp_raw %>%
+  st_make_valid() %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid()
+
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+nn_idx <- st_nearest_feature(props_ctr, hosp)
+nearest_hosp <- hosp[nn_idx, ]
+dist_vec <- st_distance(props_ctr, nearest_hosp, by_element = TRUE)
+
+dist_hosp_mi <- to_miles(dist_vec, crs_units)
+
+cand <- c("name","NAME","hospital","Hospital","FACILITY","facility",
+          "HOSPITAL","inst_name","INST_NAME","id","ID")
+hit  <- intersect(cand, names(hosp))
+hosp_col <- if (length(hit) >= 1) hit[1] else NA_character_
+
+nearest_tbl <- st_drop_geometry(nearest_hosp) %>%
+  mutate(
+    prop_id       = props_ctr$prop_id,
+    dist_hosp_mi  = dist_hosp_mi
+  ) %>%
+  { if (!is.na(hosp_col)) {
+      select(., prop_id, dist_hosp_mi,
+             nearest_hospital = !!sym(hosp_col))
+    } else {
+      select(., prop_id, dist_hosp_mi)
+    }
+  } %>%
+  mutate(
+    service_band_code = case_when(
+      dist_hosp_mi < 1                     ~ 1L,
+      dist_hosp_mi >= 1 & dist_hosp_mi < 5 ~ 2L,
+      TRUE                                 ~ 3L
+    ),
+    service_band = factor(
+      service_band_code,
+      levels = c(1L, 2L, 3L),
+      labels = c("Too Close", "Within Service", "Out of Service"),
+      ordered = TRUE
+    )
+  )
+
+clean_data <- clean_data %>%
+  left_join(nearest_tbl, by = "prop_id")
+
+
+### 3f. Park access
+
+# only polygon parks
+is_poly <- st_geometry_type(parks_raw) %in% c("POLYGON","MULTIPOLYGON")
+parks <- parks_raw[is_poly, ] %>%
+  st_make_valid() %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid()
+
+nn_idx <- st_nearest_feature(clean_data, parks)
+nearest_parks <- parks[nn_idx, ]
+dist_vec <- st_distance(clean_data, nearest_parks, by_element = TRUE)
+
+units_gdal <- tryCatch(st_crs(CRS_TARGET)$units_gdal, error = function(e) NA_character_)
+dist_park_ft <- to_feet(dist_vec, units_gdal)
+dist_park_mi <- to_miles(dist_vec, units_gdal)
+
+cand <- c("park_name","name","NAME","asset_name","ASSET_NAME",
+          "site_name","SITE_NAME","prop_name","PROP_NAME")
+hit  <- intersect(cand, names(parks))
+park_col <- if (length(hit) >= 1) hit[1] else NA_character_
+
+nearest_tbl <- st_drop_geometry(nearest_parks) %>%
+  mutate(
+    prop_id      = clean_data$prop_id,
+    dist_park_ft = dist_park_ft,
+    dist_park_mi = dist_park_mi
+  ) %>%
+  { if (!is.na(park_col)) {
+      select(., prop_id, dist_park_ft, dist_park_mi,
+             nearest_park = !!sym(park_col))
+    } else {
+      select(., prop_id, dist_park_ft, dist_park_mi)
+    }
+  }
+
+clean_data <- clean_data %>%
+  left_join(nearest_tbl, by = "prop_id")
+
+
+### 3g. School access
+
+schools <- schools_in %>%
+  st_make_valid() %>%
+  mutate(type_norm = norm_school_type(.data[["type_specific"]])) %>%
+  filter(!is.na(type_norm))
+
+# if polygons, collapse to point-on-surface
+if (any(st_geometry_type(schools) %in% c("POLYGON","MULTIPOLYGON"))) {
+  st_geometry(schools) <- st_point_on_surface(st_geometry(schools))
+}
+
+schools <- schools %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+sch_pub  <- filter(schools, type_norm == "public")
+sch_char <- filter(schools, type_norm == "charter")
+sch_priv <- filter(schools, type_norm == "private")
+
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid()
+
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+units_gdal <- tryCatch(st_crs(CRS_TARGET)$units_gdal, error = function(e) NA_character_)
+
+dist_school_public_ft  <- nearest_dist_ft(props_ctr, sch_pub,  units_gdal)
+dist_school_charter_ft <- nearest_dist_ft(props_ctr, sch_char, units_gdal)
+dist_school_private_ft <- nearest_dist_ft(props_ctr, sch_priv, units_gdal)
+
+dist_tbl <- st_drop_geometry(props_ctr) %>%
+  transmute(
+    prop_id,
+    dist_school_public_ft  = dist_school_public_ft,
+    dist_school_charter_ft = dist_school_charter_ft,
+    dist_school_private_ft = dist_school_private_ft
+  )
+
+clean_data <- clean_data %>%
+  left_join(dist_tbl, by = "prop_id")
+
+
+### 3h. Food access
+
+clean_data <- clean_data %>%
+  st_transform(CRS_TARGET) %>%
+  st_make_valid()
+
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+food_proc <- food_raw %>%
+  st_make_valid()
+
+if (any(st_geometry_type(food_proc) %in% c("POLYGON","MULTIPOLYGON"))) {
+  st_geometry(food_proc) <- st_point_on_surface(st_geometry(food_proc))
+}
+
+food_proc <- food_proc %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+if (nrow(food_proc) == 0L) {
+  clean_data <- clean_data %>%
+    mutate(
+      dist_foodretail_ft   = NA_real_,
+      foodretail_1mi_count = 0L
+    )
+} else {
+  units_gdal <- tryCatch(st_crs(CRS_TARGET)$units_gdal, error = function(e) NA_character_)
+  one_mile <- if (isTRUE(units_gdal %in% c("metre","m"))) 1609.344 else 5280
+
+  nn_idx <- st_nearest_feature(props_ctr, food_proc)
+  nearest_food <- food_proc[nn_idx, ]
+  dist_vec <- st_distance(props_ctr, nearest_food, by_element = TRUE)
+  dist_foodretail_ft <- to_feet(dist_vec, units_gdal)
+
+  buf_1mi <- st_buffer(props_ctr, one_mile)[, "prop_id"]
+  cnt_tbl <- st_join(buf_1mi, food_proc, join = st_intersects, left = TRUE) %>%
+    st_drop_geometry() %>%
+    count(prop_id, name = "foodretail_1mi_count")
+
+  dist_tbl <- st_drop_geometry(props_ctr) %>%
+    transmute(prop_id, dist_foodretail_ft = dist_foodretail_ft)
+
+  clean_data <- clean_data %>%
+    left_join(dist_tbl, by = "prop_id") %>%
+    left_join(cnt_tbl, by = "prop_id") %>%
+    mutate(foodretail_1mi_count = coalesce(foodretail_1mi_count, 0L))
+}
+
+
+### 3i. Police access
+
+pol_proc <- pol_raw %>%
+  st_make_valid()
+
+if (any(st_geometry_type(pol_proc) %in% c("POLYGON","MULTIPOLYGON"))) {
+  st_geometry(pol_proc) <- st_point_on_surface(st_geometry(pol_proc))
+}
+
+pol_proc <- pol_proc %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+if (nrow(pol_proc) == 0L) {
+  clean_data <- clean_data %>%
+    mutate(dist_police_ft = NA_real_)
+} else {
+  clean_data <- clean_data %>%
+    st_transform(CRS_TARGET) %>%
+    st_make_valid()
+
+  props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+  nn_idx <- st_nearest_feature(props_ctr, pol_proc)
+  nearest_pol <- pol_proc[nn_idx, ]
+  dist_vec <- st_distance(props_ctr, nearest_pol, by_element = TRUE)
+  units_gdal <- tryCatch(st_crs(CRS_TARGET)$units_gdal, error = function(e) NA_character_)
+  dist_police_ft <- to_feet(dist_vec, units_gdal)
+
+  cand <- c("name","station","precinct","district","NAME","STATION",
+            "DISTRICT","FACILITY","facility","id","ID")
+  hit  <- intersect(cand, names(pol_proc))
+  pol_col <- if (length(hit) >= 1) hit[1] else NA_character_
+
+  nearest_tbl <- st_drop_geometry(nearest_pol) %>%
+    mutate(
+      prop_id        = props_ctr$prop_id,
+      dist_police_ft = dist_police_ft
+    ) %>%
+    { if (!is.na(pol_col)) {
+        select(., prop_id, dist_police_ft,
+               nearest_police = !!sym(pol_col))
+      } else {
+        select(., prop_id, dist_police_ft)
+      }
+    }
+
+  clean_data <- clean_data %>%
+    left_join(nearest_tbl, by = "prop_id")
+}
+
+
+### 3j. Fire station access
+
+fire_proc <- fire_raw %>%
+  st_make_valid()
+
+if (any(st_geometry_type(fire_proc) %in% c("POLYGON","MULTIPOLYGON"))) {
+  st_geometry(fire_proc) <- st_point_on_surface(st_geometry(fire_proc))
+}
+
+fire_proc <- fire_proc %>%
+  st_transform(CRS_TARGET) %>%
+  filter(!st_is_empty(geometry))
+
+if (nrow(fire_proc) == 0L) {
+  clean_data <- clean_data %>%
+    mutate(dist_fire_ft = NA_real_)
+} else {
+  clean_data <- clean_data %>%
+    st_transform(CRS_TARGET) %>%
+    st_make_valid()
+
+  props_ctr <- st_centroid(clean_data)[, "prop_id"]
+
+  nn_idx <- st_nearest_feature(props_ctr, fire_proc)
+  nearest_fire <- fire_proc[nn_idx, ]
+  dist_vec <- st_distance(props_ctr, nearest_fire, by_element = TRUE)
+  units_gdal <- tryCatch(st_crs(CRS_TARGET)$units_gdal, error = function(e) NA_character_)
+  dist_fire_ft <- to_feet(dist_vec, units_gdal)
+
+  cand <- c("name","station","facility","FACILITY","STATION",
+            "company","COMPANY","house","HOUSE","id","ID")
+  hit  <- intersect(cand, names(fire_proc))
+  fire_col <- if (length(hit) >= 1) hit[1] else NA_character_
+
+  nearest_tbl <- st_drop_geometry(nearest_fire) %>%
+    mutate(
+      prop_id      = props_ctr$prop_id,
+      dist_fire_ft = dist_fire_ft
+    ) %>%
+    { if (!is.na(fire_col)) {
+        select(., prop_id, dist_fire_ft,
+               nearest_fire = !!sym(fire_col))
+      } else {
+        select(., prop_id, dist_fire_ft)
+      }
+    }
+
+  clean_data <- clean_data %>%
+    left_join(nearest_tbl, by = "prop_id")
+}
+
+```
+
+
+```{r}
+#| label: ACS-Integrate
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+############################################################
+# 4. ACS (tract-level sociodemographic context)
+############################################################
+
+# race / ethnicity
+race_vars <- c(
+  total     = "B03002_001",
+  white_nh  = "B03002_003",
+  black_nh  = "B03002_004",
+  asian_nh  = "B03002_006",
+  hispanic  = "B03002_012"
+)
+
+pa_race <- get_acs(
+  geography = GEOG,
+  state = STATE_FIPS,
+  year = ACS_YEAR,
+  survey = "acs5",
+  variables = race_vars,
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    pct_white    = 100 * white_nhE / totalE,
+    pct_black    = 100 * black_nhE / totalE,
+    pct_hispanic = 100 * hispanicE / totalE,
+    pct_asian    = 100 * asian_nhE / totalE
+  )
+
+# age structure
+b01001  <- get_acs(
+  geography = GEOG,
+  state = STATE_FIPS,
+  year = ACS_YEAR,
+  survey = "acs5",
+  table = "B01001"
+)
+
+vdict   <- load_variables(ACS_YEAR, "acs5", cache = TRUE)
+
+b01001l <- b01001 %>%
+  left_join(vdict %>% select(name, label), by = c("variable" = "name"))
+
+sum_ages <- function(df, pats) {
+  df %>%
+    filter(str_detect(label, paste(pats, collapse = "|"))) %>%
+    group_by(GEOID) %>%
+    summarize(estimate = sum(estimate, na.rm = TRUE), .groups = "drop")
+}
+
+age_total <- b01001l %>%
+  filter(str_detect(label, "Total:")) %>%
+  group_by(GEOID) %>%
+  summarize(pop_total = first(estimate), .groups = "drop")
+
+age_25_44 <- sum_ages(
+  b01001l,
+  c("Male:!!25 to 29 years","Male:!!30 to 34 years",
+    "Male:!!35 to 39 years","Male:!!40 to 44 years",
+    "Female:!!25 to 29 years","Female:!!30 to 34 years",
+    "Female:!!35 to 39 years","Female:!!40 to 44 years")
+) %>% rename(age_25_44 = estimate)
+
+age_45_64 <- sum_ages(
+  b01001l,
+  c("Male:!!45 to 49 years","Male:!!50 to 54 years",
+    "Male:!!55 to 59 years","Male:!!60 and 61 years",
+    "Male:!!62 to 64 years",
+    "Female:!!45 to 49 years","Female:!!50 to 54 years",
+    "Female:!!55 to 59 years","Female:!!60 and 61 years",
+    "Female:!!62 to 64 years")
+) %>% rename(age_45_64 = estimate)
+
+age_65p <- sum_ages(
+  b01001l,
+  c("Male:!!65 and 66 years","Male:!!67 to 69 years",
+    "Male:!!70 to 74 years","Male:!!75 to 79 years",
+    "Male:!!80 to 84 years","Male:!!85 years and over",
+    "Female:!!65 and 66 years","Female:!!67 to 69 years",
+    "Female:!!70 to 74 years","Female:!!75 to 79 years",
+    "Female:!!80 to 84 years","Female:!!85 years and over")
+) %>% rename(age_65plus = estimate)
+
+pa_age <- age_total %>%
+  left_join(age_25_44, by = "GEOID") %>%
+  left_join(age_45_64, by = "GEOID") %>%
+  left_join(age_65p,   by = "GEOID") %>%
+  mutate(
+    pct_age_25_44 = 100 * age_25_44 / pop_total,
+    pct_age_45_64 = 100 * age_45_64 / pop_total,
+    pct_age_65plus = 100 * age_65plus / pop_total
+  ) %>%
+  select(GEOID, pct_age_25_44, pct_age_45_64, pct_age_65plus)
+
+# housing + rent
+housing_vars <- c(
+  hu_total  = "B25002_001",
+  hu_vacant = "B25002_003",
+  med_rent  = "B25064_001"
+)
+pa_housing <- get_acs(
+  geography = GEOG,
+  state = STATE_FIPS,
+  year = ACS_YEAR,
+  survey = "acs5",
+  variables = housing_vars,
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    vacancy_rate   = 100 * hu_vacantE / hu_totalE,
+    med_gross_rent = med_rentE
+  )
+
+# income + poverty
+inc_pov_vars <- c(
+  med_hh_inc = "B19013_001",
+  pov_below  = "B17001_002",
+  pov_univ   = "B17001_001"
+)
+pa_inc_pov <- get_acs(
+  geography = GEOG,
+  state = STATE_FIPS,
+  year = ACS_YEAR,
+  survey = "acs5",
+  variables = inc_pov_vars,
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    med_hh_income = med_hh_incE,
+    poverty_rate  = 100 * pov_belowE / pov_univE
+  )
+
+# education
+b15003 <- get_acs(
+  geography = GEOG,
+  state = STATE_FIPS,
+  year = ACS_YEAR,
+  survey = "acs5",
+  table = "B15003"
+)
+edu_total <- b15003 %>%
+  filter(variable == "B15003_001") %>%
+  select(GEOID, edu_total = estimate)
+
+ba_plus_codes <- c("B15003_022","B15003_023","B15003_024","B15003_025")
+edu_bap <- b15003 %>%
+  filter(variable %in% ba_plus_codes) %>%
+  group_by(GEOID) %>%
+  summarize(ba_plus = sum(estimate, na.rm = TRUE), .groups = "drop")
+
+hs_only_code <- "B15003_017"
+edu_hs <- b15003 %>%
+  filter(variable == hs_only_code) %>%
+  transmute(GEOID, hs_only = estimate)
+
+pa_edu <- edu_total %>%
+  left_join(edu_bap, by = "GEOID") %>%
+  left_join(edu_hs,  by = "GEOID") %>%
+  mutate(
+    pct_ba_plus = 100 * ba_plus / edu_total,
+    pct_hs_only = 100 * hs_only / edu_total
+  ) %>%
+  select(GEOID, pct_ba_plus, pct_hs_only)
+
+# unemployment
+labor_vars <- c(
+  civ_lf     = "B23025_003",
+  unemployed = "B23025_005"
+)
+pa_labor <- get_acs(
+  geography = GEOG,
+  state = STATE_FIPS,
+  year = ACS_YEAR,
+  survey = "acs5",
+  variables = labor_vars,
+  output = "wide"
+) %>%
+  transmute(
+    GEOID,
+    unemployment_rate = 100 * unemployedE / civ_lfE
+  )
+
+PA_ACS <- pa_race %>%
+  left_join(pa_age,     by = "GEOID") %>%
+  left_join(pa_housing, by = "GEOID") %>%
+  left_join(pa_inc_pov, by = "GEOID") %>%
+  left_join(pa_edu,     by = "GEOID") %>%
+  left_join(pa_labor,   by = "GEOID")
+
+
+############################################################
+# 5. ATTACH TRACT GEOID TO PARCELS AND MERGE ACS
+############################################################
+
+# get statewide tracts, project to CRS_TARGET
+pa_tracts <- tracts(state = "PA", year = ACS_YEAR, class = "sf") %>%
+  st_transform(CRS_TARGET) %>%
+  select(GEOID)
+
+props_ctr <- st_centroid(clean_data)[, "prop_id"]
+props2tract <- st_join(props_ctr, pa_tracts, join = st_within, left = TRUE)
+
+clean_data <- clean_data %>%
+  left_join(st_drop_geometry(props2tract), by = "prop_id") %>%
+  left_join(PA_ACS, by = "GEOID")
+
+```
+
+
+```{r}
+#| label: finish-data
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+############################################################
+# 6. FINAL FILTERS, EXPORT, DERIVED FIELDS
+############################################################
+
+n_before <- nrow(clean_data)
+
+clean_data <- clean_data %>%
+  mutate(
+    sale_price = suppressWarnings(as.numeric(sale_price))
+  ) %>%
+  filter(!is.na(sale_price), sale_price >= 10000)
+
+n_after <- nrow(clean_data)
+message("Dropped ", n_before - n_after,
+        " rows with sale_price < $10,000 (or missing).")
+
+# create non-spatial copy for modeling, plus psf/value_multiple like you had
+sales_data <- clean_data %>%
+  st_drop_geometry() %>%
+  mutate(
+    psf = round(sale_price / total_livable_area, 2),
+    value_multiple = round(market_value / sale_price, 2)
+  ) %>%
+  arrange(psf)
+
+geom_backup <- clean_data
+
+rm(list = setdiff(ls(), c("clean_data", "sales_data", "geom_backup" )))
+
+```
+
+#### Logical Underpinning:
+
+The modeling pipeline builds a property-level dataset that doesn’t just look at what the house is, but where the house is — and that “where” part is doing a lot of work. Beyond the standard housing attributes (square footage, year built, condition, number of beds/baths, etc.), we engineered a bunch of spatial features that try to capture a home’s context in Philadelphia. Every parcel in the sales dataset was turned into geometry using its recorded shape, projected into a local coordinate reference system, and then enriched with measurements like “How far is this property from transit?” or “How many food retailers are within a mile?” The point is: we’re not just assuming the structure itself determines sale price. We’re explicitly measuring access, amenities, safety, and neighborhood context as part of value.
+
+Crime exposure is one of the biggest contextual signals we added. For every sold property, we counted the number of reported “violent” incidents within roughly two blocks (~600 feet) and the number of “non-violent/misdemeanor” incidents within about one block (~300 feet). We defined “violent” broadly — not only homicides and robberies, but any incident where a gun or weapon was mentioned in the police data. The logic is that buyers and appraisers implicitly price in perceived safety. If two houses are physically similar but one sits in an area with more firearm-related incidents, we expect downward pressure on sale price. That becomes a numeric predictor: more nearby violent incidents → potentially lower willingness to pay.
+
+We also quantified access to urban infrastructure and services, because convenience is money. For each property we measured the straight-line distance to the nearest transit stop, the nearest marked bike facility, the nearest hospital, the nearest fire station, and the nearest police station. We also measured distance to the nearest park, using parcel polygons against park polygons to approximate “are you on/next to green space or are you park-poor?” These distances were then standardized (feet or miles depending on context) and in some cases bucketed. For hospitals, for example, we didn’t just record distance — we classified properties into service bands: “Too Close” (<1 mile, which might mean sirens/traffic and isn’t always seen as a plus), “Within Service” (1–5 miles, generally good coverage), and “Out of Service” (5+ miles). That turns an abstract geometry calculation into something interpretable as access vs. nuisance.
+
+Food access is handled a little differently because it’s partly about proximity and partly about density. For each property, we calculated (1) distance to the nearest food retailer (grocery, etc.) and (2) how many food retail locations exist within a one-mile buffer around that property’s centroid. That second feature is important: being near just one corner store is not the same thing as sitting in a commercial corridor with 10+ options. A buyer will pay more, all else equal, for a place where groceries are easy, healthy food is available, and “I don’t need a car for basics” is true. That’s especially relevant in Philadelphia, where car-free living is common and neighborhood retail is a quality-of-life driver.
+
+We didn’t stop at amenities and services — we also tied every property to its neighborhood fabric. Each parcel was spatially joined to a named neighborhood (via centroid-in-neighborhood polygons), and to a Census tract. From the tract, we attached socioeconomic context from the American Community Survey: racial/ethnic composition, age structure, vacancy rate, median rent, median household income, poverty rate, unemployment rate, and educational attainment (e.g. share of adults with a bachelor’s or higher). Those variables roughly proxy demand-side pressure and neighborhood stability. High-income, low-vacancy, high-education tracts tend to support higher property prices, even for physically modest homes. That’s not just aesthetics — lenders, buyers, and investors all underwrite neighborhood trajectory, not just individual bricks.
+
+Put together, the result is a modeling dataset where sale price (or price per square foot) isn’t being predicted just from “bedrooms and bathrooms.” It’s being predicted from “bedrooms and bathrooms, plus how safe the block feels, plus how close you are to the El or a bike lane, plus whether you can walk to food, plus how your surrounding tract looks in terms of income and vacancy.” This is exactly how real-world housing markets behave: value is hyper-local and access-based. By engineering these spatial features, we’re letting the model learn the price premium (or penalty) associated with each of those location advantages — effectively turning geography into numbers the model can reason with.
+
+
+---
+
+### Part 2: Exploratory Data Analysis
+
+**Histogram: Distribution of sale prices**
+
+```{r}
+#| label: Histogram
+#| fig.width: 10
+#| fig.height: 8
+#| 
+ggplot(sales_data, aes(x = sale_price)) +
+  geom_histogram(fill = "orange", bins= 500) +
+  geom_vline(aes(xintercept = median(sale_price, na.rm = TRUE)),
+             color = "grey40", size = 0.5) +
+  annotate("text", 
+           x = median(sales_data$sale_price, na.rm = TRUE), 
+           y = Inf, vjust = 4, hjust = -0.1, 
+           label = paste0("Median = $", formatC(median(sales_data$sale_price, na.rm = TRUE), format = "f", big.mark = ",", digits = 0)),
+           color = "grey40", size = 3) +
+  labs(title = "Distribution of Philadelphia Home Sale Price", x = "Sale Price (USD)", y = "Frequency") +
+  scale_x_continuous(labels = scales::dollar)
+
+```
+**Interpretation:** This figure shows the distribution of Philadelphia home sale prices in 2023–2024, and the key pattern is that the market is extremely skewed. Most sales are clustered well under 500K USD, and the median sale price — about 241K USD, marked on the plot — is a good summary of what a “typical” home actually sells for in the city. But there’s also a very long tail of high-value transactions that stretches into the millions. Those ultra-expensive deals are rare, but they’re so large that they would pull the average price up, which is why the mean would be misleading here. This shape tells us Philadelphia isn’t one uniform housing market: it’s a mix of lower-cost rowhomes, modest rehabs, and a smaller luxury segment. The result is a city where most buyers transact in the low hundreds of thousands, but a small number of high-end sales coexist on the fringe at several million dollars.
+
+
+**Map: Geographic distribution (map)**
+
+```{r}
+#| label: Geographic-Map
+#| fig.width: 10
+#| fig.height: 10
+
+# Re-create the neighborhood layer from the URL
+
+neigh_url <- "https://raw.githubusercontent.com/opendataphilly/open-geo-data/refs/heads/master/philadelphia-neighborhoods/philadelphia-neighborhoods.geojson"
+
+neigh <- sf::read_sf(neigh_url)
+
+# 2. Make sure CRS matches parcels
+neigh <- sf::st_transform(neigh, sf::st_crs(clean_data))
+
+# 3. Build the sf of JUST the modeled sales
+#    (this step assumes both data frames still share prop_id;
+#     if prop_id got dropped from sales_data, skip the filter)
+if ("prop_id" %in% names(clean_data) &&
+    "prop_id" %in% names(sales_data)) {
+  geo_clean <- clean_data %>%
+    dplyr::filter(prop_id %in% sales_data$prop_id)
+} else {
+  geo_clean <- clean_data
+}
+
+# 4. Draw the map
+p_price_map <-
+  ggplot2::ggplot() +
+  ggplot2::geom_sf(
+    data = neigh,
+    fill = NA,
+    color = "grey70",
+    linewidth = 0.25
+  ) +
+  ggplot2::geom_sf(
+    data = geo_clean,
+    ggplot2::aes(color = sale_price),
+    alpha = 0.7,
+    size  = 0.2
+  ) +
+  scale_color_viridis_c(
+    name      = "Sale price (USD)",
+    option    = "magma",
+    direction = -1,
+    trans     = "log10",
+    breaks    = c(100000, 200000, 300000, 500000, 800000, 1200000, 2000000),
+    labels    = scales::dollar,
+    limits    = c(60000, 2000000),
+    oob       = scales::squish
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_colorbar(barheight = grid::unit(4, "cm"))
+  ) +
+  ggplot2::coord_sf() +
+  ggplot2::labs(
+    title    = "Geographical Distribution of Philadelphia Home Sale Prices",
+    subtitle = "Each property colored by sale price (log scale)"
+  ) +
+  ggplot2::theme_void(base_size = 12) +
+  ggplot2::theme(
+    legend.position = c(0.92, 0.25),
+    plot.title      = ggplot2::element_text(face = "bold", hjust = 0),
+    plot.subtitle   = ggplot2::element_text(hjust = 0)
+  )
+
+p_price_map
+```
+
+**Interpretation:** This map shows that price in Philadelphia is deeply spatial. Each point is a property sale, colored by its sale price (on a log scale so we can see variation across the whole city). You can see clusters of high-value sales in a few tight areas — darker purple concentrations in and around Center City, parts of South Philly near the core, Northern Liberties/Fishtown, and select pockets in Northwest neighborhoods. Those are the submarkets where renovated or newer housing sells at a clear premium. As you move away from those cores, especially into large areas of Southwest, lower North, and parts of far Northeast and river-adjacent industrial fringe, prices shift toward the lighter end of the palette, meaning lower transaction values. The key insight is that this isn’t a smooth gradient from “expensive downtown” to “cheap outskirts.” Instead, it’s patchy: there are block- and neighborhood-scale price islands, even within the same general region of the city. That pattern is exactly why we model price with neighborhood fixed effects — because buyers are really choosing hyperlocal markets, not just “Philadelphia, broadly.”
+
+
+**Scatter Plots: Price vs. structural features**
+
+```{r}
+#| label: structural-plot
+#| fig.width: 10
+#| fig.height: 8
+
+# Build plotting data frame with clean vars
+plot_df <- sales_data %>%
+  mutate(
+    beds     = number_of_bedrooms,
+    baths    = number_of_bathrooms,
+    liv_area = total_livable_area,
+    age      = 2024 - year_built,
+    beds_f   = factor(number_of_bedrooms),
+    baths_f  = factor(number_of_bathrooms)
+  ) %>%
+  filter(!is.na(sale_price),
+         !is.na(liv_area),
+         !is.na(age),
+         !is.na(beds), beds > 0,
+         !is.na(baths), baths > 0)
+
+## Plot A: Price vs. bedrooms (categorical)
+p_beds <- ggplot(plot_df, aes(x = beds_f, y = sale_price)) +
+  geom_jitter(width = 0.2, alpha = 0.15, size = 0.6, color = "steelblue") +
+  stat_summary(fun = median, geom = "point", color = "red", size = 2) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Bedrooms (factor)",
+    y = "Sale price (USD)",
+    title = "Price vs Bedrooms",
+    subtitle = "Each dot = a sale; red = median price in that bedroom category"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Plot B: Price vs. bathrooms (categorical)
+p_baths <- ggplot(plot_df, aes(x = baths_f, y = sale_price)) +
+  geom_jitter(width = 0.2, alpha = 0.15, size = 0.6, color = "darkorange") +
+  stat_summary(fun = median, geom = "point", color = "red", size = 2) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Bathrooms (factor)",
+    y = "Sale price (USD)",
+    title = "Price vs Bathrooms",
+    subtitle = "Adding bathrooms tends to move price up in steps, not smoothly"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Plot C: Price vs. interior living area (continuous)
+p_area <- ggplot(plot_df, aes(x = liv_area, y = sale_price)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "seagreen4") +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.7, color = "black") +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Living area (sq ft)",
+    y = "Sale price (USD)",
+    title = "Price vs Interior Size",
+    subtitle = "Larger homes almost always sell for more"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Plot D: Price vs. building age (continuous)
+p_age <- ggplot(plot_df, aes(x = age, y = sale_price)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "purple4") +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.7, color = "black") +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Building age (years)",
+    y = "Sale price (USD)",
+    title = "Price vs Building Age",
+    subtitle = "Newer buildings tend to transact higher, but there's a ton of variance"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Combine into one figure (2x2 grid)
+figure_3_structural <- (p_beds | p_baths) / (p_area | p_age)
+
+figure_3_structural
+
+```
+
+**Interpretation:** 
+
+- **Price vs Bedrooms:** Each point is an individual sale, grouped by reported bedroom count. The red dots mark the median sale price for that bedroom category. You don’t see a smooth upward climb as beds go up. Instead, most of the market activity — and most of the value — sits in the 2–4 bedroom range, and adding more bedrooms beyond that doesn’t reliably buy you a more expensive house. In fact, once you control for overall square footage in the regression, “more bedrooms in the same box” can actually be a negative signal: it often means the house has been carved up into smaller rooms instead of feeling open. That shows up here as a pretty flat (and sometimes even downward) median past 3–4 beds, rather than a luxury premium for “more bedrooms.”
+
+- **Price vs Bathrooms:** Bathrooms behave differently. As you move from 1 bath to 2 to 3+ baths, the red median markers jump upward in more distinct steps. Buyers clearly pay for bathroom count, because bathrooms are basically a livability and privacy amenity. You don’t see as much scatter in the medians as you add baths — the relationship is more monotonic. That lines up with the model result that, holding everything else constant, each additional bathroom adds meaningful sale value. In plain English: a second full bath is treated as an upgrade; a fourth bedroom is not automatically treated as an upgrade.
+
+- **Price vs Interior Size:** This panel just shows the classic size premium. Larger homes almost always sell for more. Even though there’s a long tail of huge outliers (multi-million dollar sales and extremely large properties), the main cloud is very tight and upward sloping: once you get past about 1,000–1,500 square feet of living area, prices scale up quickly. The fitted line through that cloud makes that slope obvious. That’s consistent with our regression, where each additional square foot of interior living space is worth on the order of a few dozen USD — real money — and that effect is strong even after controlling for beds and baths.
+
+- **Price vs Building Age:** Age is noisy. Newer properties (low age on the x-axis) can sell very high, which matches the story of new construction and high-end rehab commanding premiums. But as age increases, there’s a wide spread: some 100-year-old Philly rowhomes still sell for serious money, and others sell cheaply. The smooth line trends slightly downward with age, but the variance explodes. That tells you age alone isn’t destiny. In Philly’s housing stock — a lot of which is 80–120+ years old — “old” can mean “historic, updated, desirable block,” or it can mean “deferred maintenance and structural risk.” The market doesn’t punish age uniformly; it punishes age plus condition.
+
+
+**Scatter Plots: Price vs. spatial features**
+
+```{r}
+#| label: Spatial-features
+#| fig.width: 10
+#| fig.height: 8
+#| progress: false
+
+# Build plotting data frame for spatial/context features
+plot_spatial <- sales_data %>%
+  select(
+    sale_price,
+    dist_park_mi,
+    violent_2blocks,
+    foodretail_1mi_count,
+    med_hh_income
+  ) %>%
+  filter(
+    !is.na(sale_price),
+    sale_price > 0,
+    !is.na(dist_park_mi),
+    !is.na(violent_2blocks),
+    !is.na(foodretail_1mi_count),
+    !is.na(med_hh_income)
+  )
+
+## Plot A: Price vs distance to nearest park (miles)
+p_park <- ggplot(plot_spatial,
+                 aes(x = dist_park_mi, y = sale_price)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "darkgreen") +
+  geom_smooth(method = "lm", se = FALSE,
+              linewidth = 0.7, color = "black") +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Distance to nearest park (miles)",
+    y = "Sale price (USD)",
+    title = "Parks & Property Value",
+    subtitle = "Homes farther from parks tend to sell for slightly less,\nthough the effect is noisy"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Plot B: Price vs violent incidents within ~2 blocks
+p_crime <- ggplot(plot_spatial,
+                  aes(x = violent_2blocks, y = sale_price)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "firebrick") +
+  geom_smooth(method = "lm", se = FALSE,
+              linewidth = 0.7, color = "black") +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Violent incidents within ~600 ft",
+    y = "Sale price (USD)",
+    title = "Local Violent Crime",
+    subtitle = "Higher recent violent incident counts are associated with\nlower observed sale prices"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Plot C: Price vs food access (# of retailers within 1 mile)
+p_food <- ggplot(plot_spatial,
+                 aes(x = foodretail_1mi_count, y = sale_price)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "goldenrod4") +
+  geom_smooth(method = "lm", se = FALSE,
+              linewidth = 0.7, color = "black") +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Food retailers within 1 mile",
+    y = "Sale price (USD)",
+    title = "Retail Food Environment",
+    subtitle = "More nearby food retail sometimes tracks denser, more affordable areas"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Plot D: Price vs neighborhood income (ACS)
+p_income <- ggplot(plot_spatial,
+                   aes(x = med_hh_income, y = sale_price)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "navy") +
+  geom_smooth(method = "lm", se = FALSE,
+              linewidth = 0.7, color = "black") +
+  scale_x_continuous(labels = scales::dollar) +
+  scale_y_continuous(labels = scales::dollar) +
+  labs(
+    x = "Median household income (USD, tract)",
+    y = "Sale price (USD)",
+    title = "Income & Home Prices",
+    subtitle = "Higher-income Census tracts show systematically higher sale prices"
+  ) +
+  theme_minimal(base_size = 11)
+
+## Arrange in a 2x2 panel
+figure_4_spatial <- (p_park | p_crime) / (p_food | p_income)
+
+figure_4_spatial
+
+```
+
+**Interpretation:** 
+
+- **Price vs Bedrooms:** The first panel plots sale price against distance to the nearest park. There’s a weak downward pattern: homes closer to parks tend to reach somewhat higher prices, while homes farther away drift slightly lower. But the cloud is noisy — you can still get expensive sales even 0.5–0.75 miles from a park — which tells us “park adjacency” isn’t a universal price driver. It matters, but not nearly as much as core housing features like condition or size. This also hints that park access is partly a neighborhood-level amenity (already priced into where you’re buying), not always a block-by-block differentiator.
+
+- **Local Violent Crime:** Here we see sale price versus the number of violent incidents within roughly 600 feet of the property. This relationship is a lot more directional: higher recent violent counts are associated with sharply lower sale prices. The bottom edge of the market clusters in high-violence blocks, and the very high-dollar sales almost never appear where violence is concentrated. This backs up what we saw in the regression: even within the same nominal neighborhood, buyers are discounting blocks that feel unsafe. Street-level safety is being priced into the deal.
+
+- **Retail Food Environment:** This panel shows how sale price varies with the number of food retailers within a one-mile radius. There’s basically no clean slope: properties in areas with lots of nearby grocers/delis/bodegas span the full range from cheaper houses to million-dollar-plus sales. If anything, very high counts of food outlets often show up in dense, lower-cost parts of the city — which makes sense in Philly, where corner retail is common in rowhouse neighborhoods. So “more food within a mile” doesn’t automatically equal “higher value.” It’s more of a neighborhood-style signal (urban, walkable, older fabric) than a direct premium within that neighborhood.
+
+- **Income & Home Prices:** This last panel compares Census tract median household income to sale price. Here the slope is much clearer and positive: higher-income tracts systematically produce higher sale prices, and you almost never see ultra-high-dollar sales in the very lowest-income tracts. That’s basically the social geography of value. It reflects more than house quality — it’s also about perceived status, lending environment, school expectations, and long-run stability. This is exactly the kind of demographic gradient that still shows up in the model even after we control for physical housing traits.
+
+
+**Bubble Plot: One creative visualization**
+
+```{r}
+#| label: creative-bubble-map
+#| fig.width: 10
+#| fig.height: 8
+#| progress: false
+
+acs_vars <- c(
+  med_income   = "B19013_001",
+  poverty_rate = "S1701_C02_001"
+)
+
+acs_tracts <- get_acs(
+  geography = "tract",
+  state     = "PA",
+  county    = "Philadelphia",
+  variables = acs_vars,
+  year      = 2023,
+  survey    = "acs5",
+  geometry  = TRUE,
+  cache_table = TRUE
+) %>%
+  select(GEOID, variable, estimate, geometry) %>%
+  st_transform(st_crs(geo_clean)) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  st_as_sf()
+
+acs_to_neigh <- acs_tracts %>%
+  st_point_on_surface() %>%
+  st_join(neigh %>% select(NAME)) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(NAME)) %>%
+  group_by(NAME) %>%
+  summarise(
+    med_income_acs   = median(med_income, na.rm = TRUE),
+    poverty_rate_acs = median(poverty_rate, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+sales_neigh <- sales_data %>%
+  filter(sale_price > 0) %>%
+  group_by(neigh_name) %>%
+  summarise(
+    n_sales      = n(),
+    median_price = median(sale_price, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+neigh_summary_fixed <- sales_neigh %>%
+  left_join(acs_to_neigh, by = c("neigh_name" = "NAME")) %>%
+  drop_na(med_income_acs, poverty_rate_acs)
+
+p_neigh_bubble_fixed <-
+  ggplot(neigh_summary_fixed,
+         aes(x = med_income_acs, y = median_price,
+             size = n_sales, color = poverty_rate_acs)) +
+  geom_point(alpha = 0.85) +
+  scale_x_continuous(labels = scales::dollar) +
+  scale_y_continuous(labels = scales::dollar) +
+  scale_color_viridis_c(option = "plasma", name = "Poverty rate (%)") +
+  scale_size_continuous(name = "Sales count", range = c(2, 10)) +
+  labs(
+    title = "Neighborhood Economics and Home Prices",
+    subtitle = "Each point = a neighborhood (2023–2024 sales)\nX: ACS Median household income · Y: Median sale price · Color: ACS poverty rate · Size: sales count",
+    x = "Median household income (USD)",
+    y = "Median sale price (USD)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+p_neigh_bubble_fixed
+
+```
+
+**Interpretation:** This bubble chart is basically the “neighborhood market reality” view. Each dot is a Philadelphia neighborhood, and we’re plotting its median sale price (y-axis) against its median household income from ACS (x-axis). Two things jump out immediately. First, the slope is very positive: richer neighborhoods almost always have higher typical sale prices. You almost never see a low-income neighborhood with a 700K+ median sale price, and you don’t see high-income neighborhoods with 150K medians — so price and local income are tightly linked at the neighborhood scale. Second, the color shading (poverty rate) lines up with that same gradient: neighborhoods with high poverty (yellow) sit in the low-income / low-price corner, while wealthier neighborhoods (purple/blue, lower poverty) show higher sales prices. The dot size is how many homes sold, which tells you where volume is. You can see that most of the activity (the big circles) is happening in the middle of the distribution — not the ultra-rich enclaves and not the most distressed areas, but the working-to-middle income neighborhoods. In plain language: Philadelphia’s housing market is stratified by neighborhood wealth and poverty status, and that stratification is not subtle.
+
+---
+
+### Part 3: Feature Pruning
+
+```{r}
+#| label: Feature-Selection
+#| message: false
+#| warning: false
+#| Results: false
+
+select_data <- sales_data |> 
+  select(year_built, number_of_bathrooms, number_of_bedrooms, basements, 
+         fireplaces, garage_spaces,
+         general_construction, interior_condition, exterior_condition, 
+         census_tract, neigh_name, 
+         value_multiple, market_value, sale_price, total_area, total_livable_area, 
+         psf, violent_2blocks, petty_1block, dist_park_mi, 
+         vacancy_rate, med_gross_rent, med_hh_income, pct_ba_plus, 
+         pct_white, pct_black, pct_hispanic, pct_asian,
+         foodretail_1mi_count, 
+         dist_school_public_ft, dist_school_charter_ft, 
+         pct_age_25_44, pct_age_65plus,
+         poverty_rate, unemployment_rate) |> 
+  filter(number_of_bathrooms > 0, number_of_bedrooms > 0) |> 
+  mutate(age = 2024 - year_built,
+         basements = dplyr::recode(trimws(as.character(basements)),
+                              "0"="0","A"="1","B"="2","C"="3","D"="4","E"="5",
+                              "F"="6","G"="7","H"="8","I"="9"),
+         basements = as.integer(basements)) |> 
+  rename(
+    baths      = number_of_bathrooms,
+    beds       = number_of_bedrooms,
+    construction = general_construction,
+    interior   = interior_condition,
+    exterior   = exterior_condition,
+    garage     = garage_spaces,
+    tract      = census_tract,
+    neigh      = neigh_name,
+    mkt_value  = market_value,
+    area       = total_area,
+    liv_area   = total_livable_area
+  )
+```
+
+
+**Reasoning:** For the modeling stage we deliberately narrowed the feature set to variables that are (1) directly interpretable in a housing valuation context, (2) broadly available across observations, and (3) not redundant with each other. The earlier pipeline generated a huge number of spatial and contextual attributes — multiple school distance measures, different types of crime buffers, access to transit, bike lanes, fire/police proximity, hospital service bands, etc. That’s great for exploratory geography-of-equity questions, but it’s overkill (and sometimes harmful) for estimating price. Many of those features are highly collinear with each other or with neighborhood identity, and a lot of them introduce sparsity because they’re missing for certain parcels or depend on fragile spatial joins. Here, we keep classic structural housing characteristics (beds, baths, living area, age, basements, condition, garage, fireplaces), because buyers literally pay for those. We keep a small set of location/amenity signals that plausibly capitalize into price and that we trust methodologically: nearby violent incidents (violent_2blocks), food access density (foodretail_1mi_count), park proximity (dist_park_mi), and distance to schools. We also attach tract-level socioeconomic context from ACS (income, vacancy, education, race composition, poverty, unemployment, and age structure) to proxy neighborhood demand and perceived quality. Finally, we retain sale_price itself plus market_value and ratios like value_multiple and psf, because those let us study how assessment and unit price per square foot behave. In short, we’re trimming down to high-signal, low-missingness, economically meaningful predictors and dropping niche engineering steps that add noise, inflate multicollinearity, or don’t generalize well in a pricing model.
+
+
+```{r}
+#| label: Real-Estate-Flags
+#| message: false
+#| warning: false
+#| Results: false
+
+# Intuition: market value should not deviate substantially from the sale price
+value_range <- select_data |> 
+  summarize(
+    q1    = quantile(value_multiple, 0.25, na.rm = TRUE),
+    q3    = quantile(value_multiple, 0.75, na.rm = TRUE),
+    iqr   = q3 - q1,
+    lower = q1 - 1.5 * iqr,
+    upper = q3 + 1.5 * iqr
+  )
+
+# Kable table for value_range
+value_range |> 
+  mutate(
+    q1    = round(q1, 2),
+    q3    = round(q3, 2),
+    iqr   = round(iqr, 2),
+    lower = round(lower, 2),
+    upper = round(upper, 2)
+  ) |>
+  kable(
+    caption = "Flag thresholds for Value Multiple (Assessed Value ÷ Sale Price)",
+    col.names = c("Q1", "Q3", "IQR", "Lower Bound", "Upper Bound"),
+    align = "c",
+    digits = 2,
+    format = "html"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+# Intuition: psf outliers are likely non-market transactions
+psf_range <- select_data |> 
+  summarize(
+    q1    = quantile(psf, 0.25, na.rm = TRUE),
+    q3    = quantile(psf, 0.75, na.rm = TRUE),
+    iqr   = q3 - q1,
+    lower = q1 - 1.5 * iqr,
+    upper = q3 + 1.5 * iqr
+  )
+
+# Kable table for psf_range
+psf_range |>
+  mutate(
+    q1    = round(q1, 2),
+    q3    = round(q3, 2),
+    iqr   = round(iqr, 2),
+    lower = round(lower, 2),
+    upper = round(upper, 2)
+  ) |>
+  kable(
+    caption = "Flag thresholds for psf (Price per Square Foot)",
+    col.names = c("Q1", "Q3", "IQR", "Lower Bound", "Upper Bound"),
+    align = "c",
+    digits = 2,
+    format = "html"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+# Clean data used for modeling / mapping
+clean_data <- select_data |> 
+  filter(
+    liv_area > 500,
+    area > 500,
+    between(psf, 40, 800),
+    between(value_multiple, 0.4, 2.0)
+  ) |> 
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |> 
+  tidyr::drop_na() |> 
+  arrange(liv_area)
+
+# Nicely show the first ~10 rows
+clean_data |> 
+  slice_head(n = 10) |>
+  kable(
+    caption = "Cleaned transaction data (first 10 rows after filters)",
+    align = "c",
+    format = "html"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+```
+
+**Interpretation:** 
+On top of trimming the feature set, we also had to sanity-check which sales even look like real, arm’s-length residential transactions. Property data always includes junk: family transfers for 1 USD, sheriff sales, partial interest transfers, renovation shells, or clerical weirdness (like a 2,000 sq ft rowhouse supposedly selling for 9 million USD). If we blindly feed that into a price model, the model learns nonsense. So we added a set of “real estate flags” to identify and drop those bad rows.
+
+We use two main diagnostics: `value_multiple` and `psf`. `value_multiple` is the ratio of the city’s assessed market value to the actual recorded sale price. In a normal sale, the assessment may be a little high or a little low, but it shouldn’t be wildly off. So we look at the distribution of that ratio, get the interquartile range (IQR), and compute fence cutoffs (Q1 − 1.5×IQR, Q3 + 1.5×IQR). Extreme cases — where assessed value is, say, 5× the sale price or 0.1× the sale price — usually mean something non-market happened (distress sale, title correction, bundled sale, etc.). Those points don’t reflect what a typical buyer would pay for that one house, so we trim them. We do the same idea with `psf` (price per square foot of livable area). psf is a super useful “unit price” signal in real estate, but absurdly low psf often means interior is trashed/gutted or it wasn’t a real arm’s-length sale, and absurdly high psf often means the record is actually for a multi-parcel package or a luxury outlier that behaves more like commercial than typical housing. By fencing psf with IQR cutoffs (and then enforcing a practical range like 40–800 USD per sq ft), we keep what looks like real open-market housing trades in Philadelphia and drop pathological edge cases.
+
+We also add basic physical filters: we require reasonable built form (livable area and lot area both over 500 sq ft, because “houses” with 120 sq ft recorded living area are usually data entry mistakes or partial condo interests). Then we require that all key numeric predictors exist and aren’t missing, and we round numeric values for cleaner interpretation. The result is `clean_data`: a modeling dataset that’s been denoised both structurally and financially. This step matters because linear models are very sensitive to extreme outliers — a handful of fake 1 USD transfers or impossible 5,000 USD/sf lofts can dominate the fit, wreck cross-validation metrics, and drown out the more subtle spatial and neighborhood effects we actually care about.
+
+
+---
+
+### Part 4: Modeling Building
+
+
+```{r}
+
+clean_data$neigh <- as.factor(clean_data$neigh)
+clean_data$interior <- as.factor(clean_data$interior)
+clean_data$exterior <- as.factor(clean_data$exterior)
+clean_data$basements <- as.factor(clean_data$basements)
+
+set.seed(5080) # Set seed for reproducibility
+ctrl <- trainControl(method = "cv", number = 10) #10-Fold CV
+
+# Model 1: Structural
+cv_m1 <- train(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2),
+  data = clean_data, method = "lm", trControl = ctrl
+)
+
+# Model 2: + Spatial
+cv_m2 <- train(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2) +
+  dist_park_mi + foodretail_1mi_count + dist_school_public_ft
+  + vacancy_rate + med_gross_rent + med_hh_income + pct_ba_plus + pct_black + pct_white
+  + poverty_rate + unemployment_rate + pct_age_25_44 + pct_age_65plus,
+  data = clean_data, method = "lm", trControl = ctrl
+)
+
+# Model 3: + Neighborhood Fixed Effects
+cv_m3 <- train(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2) +
+  dist_park_mi + foodretail_1mi_count + dist_school_public_ft +
+  vacancy_rate + med_gross_rent + med_hh_income + pct_ba_plus + pct_black + pct_white +
+  poverty_rate + unemployment_rate + pct_age_25_44 + pct_age_65plus +
+  neigh, 
+  data = clean_data, method = "lm", trControl = ctrl
+)
+
+# Model 4: + Small Neighborhoods + Mkt Value
+clean_data <- clean_data |> 
+  add_count(neigh) |> 
+  mutate(
+    neigh_cv = if_else(
+      n < 10,                       # If fewer than 10 sales
+      "Small_Neighborhoods",        # Group them
+      as.character(neigh)           # Keep original
+    ),
+    neigh_cv = as.factor(neigh_cv)
+  )
+
+cv_m4 <- train(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2) +
+  violent_2blocks + dist_park_mi + foodretail_1mi_count + dist_school_public_ft + 
+  vacancy_rate + med_gross_rent + med_hh_income + pct_ba_plus + pct_black + pct_white +
+  poverty_rate + unemployment_rate + pct_age_25_44 + pct_age_65plus + 
+  mkt_value +
+  neigh_cv, 
+  data = clean_data, method = "lm", trControl = ctrl
+)
+
+# Model 5: + Simpler + Mkt Value
+cv_m5 <- train(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2) +
+  dist_park_mi + foodretail_1mi_count + dist_school_public_ft +
+  mkt_value +
+  neigh_cv,  
+  data = clean_data, method = "lm", trControl = ctrl
+)
+
+# Model 6: Simpler Only
+cv_m6 <- train(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2) +
+  dist_park_mi + foodretail_1mi_count + dist_school_public_ft + 
+  neigh_cv,  
+  data = clean_data, method = "lm", trControl = ctrl
+)
+
+# Compare
+model_compare <- data.frame(
+  Model = c(
+    "Structural",
+    "Spatial",
+    "Fixed Effects",
+    "Small Neighborhoods + Mkt Value",
+    "Simpler + Mkt Value",
+    "Simpler Only"
+  ),
+  Rsquared = c(
+    cv_m1$results$Rsquared,
+    cv_m2$results$Rsquared,
+    cv_m3$results$Rsquared,
+    cv_m4$results$Rsquared,
+    cv_m5$results$Rsquared,
+    cv_m6$results$Rsquared
+  ),
+  RMSE = c(
+    cv_m1$results$RMSE,
+    cv_m2$results$RMSE,
+    cv_m3$results$RMSE,
+    cv_m4$results$RMSE,
+    cv_m5$results$RMSE,
+    cv_m6$results$RMSE
+  ),
+  MAE = c(
+    cv_m1$results$MAE,
+    cv_m2$results$MAE,
+    cv_m3$results$MAE,
+    cv_m4$results$MAE,
+    cv_m5$results$MAE,
+    cv_m6$results$MAE
+  )
+) |>
+  mutate(
+    R2 = round(Rsquared, 3),
+    RMSE = round(RMSE, 0),
+    MAE = round(MAE, 0)
+  ) |>
+  select(
+    Model,
+    `R² (CV)` = R2,
+    `RMSE (CV)` = RMSE,
+    `MAE (CV)` = MAE
+  )
+
+model_compare |>
+  kable(
+    caption = "10-fold CV performance across model specifications",
+    align = c("l", "c", "c", "c"),
+    format = "html"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left") |>
+  row_spec(1, bold = TRUE) |>
+  column_spec(1, width = "8cm") |>
+  add_header_above(
+    c(" " = 1, "Out-of-Sample Fit Metrics" = 3)
+  )
+
+```
+
+**Discussion:**
+We trained a sequence of models using 10-fold cross-validation to see how different groups of predictors affect out-of-sample accuracy. The first model (“Structural”) uses only property-level physical characteristics: bedrooms, bathrooms, finished basement indicators, interior/exterior condition, living area, and building age. This baseline already explains about 67% of the variation in sale price (CV R² ≈ 0.67), but it’s still pretty rough: the average out-of-sample error is large, with an RMSE of about $136K and an average absolute error (MAE) of about 90K USD. In plain English, even if you know what the house is and what shape it’s in, you’re still often off by six figures. That’s a sign that location — broadly defined — is doing a lot of work in Philadelphia’s housing market.
+
+When we layer in block-scale spatial features and neighborhood socioeconomic context (“Spatial”), accuracy improves a lot. The R² jumps from ~0.67 to ~0.79, and RMSE drops from ~136K to ~108K. This version adds things like violent incidents within two blocks, distance to parks and schools, local retail access, and census tract indicators such as income, rent, vacancy, and demographics. That improvement tells us two things: (1) buyers absolutely price the surrounding environment — safety, access, social context — not just the building; and (2) those effects are strong enough to generalize out of sample. We’re not just overfitting noise; spatial context is genuinely predictive of what a house will sell for.
+
+But “Spatial” is still treating the city as one big market. The third model (“Fixed Effects”) adds neighborhood fixed effects — basically, a separate intercept for each neighborhood — which soaks up persistent price differences between places like Fishtown, Point Breeze, Chestnut Hill, etc. That pushes R² to ~0.85 and drops RMSE to about 93K. This is a big deal. It means two homes with the same size, same condition, and same local crime exposure will still trade at systematically different price levels depending on which named neighborhood they’re in. In other words: neighborhood identity itself, not just measured amenities, is priced.
+
+From there, we refine how we treat neighborhood. The fourth model (“Small Neighborhoods + Mkt Value”) does two important things: (1) it collapses very small neighborhoods (with <10 observed sales) into a pooled “Small_Neighborhoods” bin so that those areas don’t produce unstable fixed effects, and (2) it adds the city’s assessed market value (mkt_value) as a predictor. This changes everything. Performance jumps massively: R² rises to ~0.92 and RMSE falls to about 65K, cutting typical error almost in half compared to the baseline structural model. MAE also drops to about 42K. This model is both high-performing and still interpretable: it blends physical house attributes, micro-spatial exposure (crime, distance to parks, etc.), socioeconomic context, and a stabilized neighborhood effect, plus an institutional pricing signal (assessed market value). That combination is our best-performing “full” model.
+
+Then we test whether we can simplify without losing accuracy. The fifth model (“Simpler + Mkt Value”) strips out some of the weaker spatial/ACS controls but keeps assessed value and the smoothed neighborhood factor. Its performance is basically identical to the full version: R² ≈ 0.925, RMSE ≈ 65K, MAE ≈ 42K. That tells us there’s some redundancy — once you include assessed market value and a good neighborhood structure, you don’t necessarily need every single contextual variable to hit high predictive accuracy.
+
+Finally, we try “Simpler Only,” which keeps neighborhood effects but drops assessed value. Performance falls back: R² slips to ~0.84 and RMSE rises to ~95K, more like the plain fixed-effects model. That last comparison is super informative: it shows that the assessed market value term is doing a ton of predictive work. It acts like a summary statistic for block-level desirability, renovation quality, curb appeal, and whatever else the city’s assessment office is “seeing.” In practice, the best cross-validated model is the version that includes (i) structural features of the home, (ii) a stabilized neighborhood factor, and (iii) assessed market value. That model is accurate, relatively compact, and realistic to deploy for valuation or forecasting.
+
+
+
+```{r}
+fe_m4 <- feols(
+  sale_price ~ beds + baths + basements + interior + exterior + liv_area + poly(age, 2) +
+    violent_2blocks + dist_park_mi + foodretail_1mi_count + dist_school_public_ft + 
+    vacancy_rate + med_gross_rent + med_hh_income + pct_ba_plus + pct_black + pct_white +
+    poverty_rate + unemployment_rate + pct_age_25_44 + pct_age_65plus + 
+    mkt_value |                    # left of | = regular covariates
+    neigh_cv,                      # right of | = fixed effect(s) to absorb
+  data = clean_data
+)
+
+# Pretty table (no neighborhood FE dummies will show)
+
+modelsummary(
+  list("Fourth Model (FE absorbed + MKT Value)" = fe_m4),
+  gof_omit  = 'IC|Adj|Log|F',
+  statistic = "({std.error})",     
+  estimate  = "{estimate}{stars}",
+  stars     = c('*'=.1,'**'=.05,'***'=.01),
+  output    = "markdown"
+)
+
+lm_model4 <- cv_m4$finalModel
+
+```
+
+**Coefficient Interpretation:**
+
+This model is estimated with neighborhood fixed effects (via neigh_cv), which means we’re not comparing a 1M USD rowhome in Center City to a 90K USD shell in Kensington. We’re comparing houses within the same local market bucket. So every coefficient should be read as: “holding the neighborhood constant, and holding everything else constant, how does this feature change sale price?” That matters because Philadelphia has a lot of lower- and middle-income housing stock with smaller square footage, aging structures, and incremental rehab. In that environment, buyers trade off things like layout, livable condition, block safety, and perceived stability more than just raw square footage. The fixed effects soak up the broad neighborhood premium/discount (schools, reputation, amenities, hype), so what’s left is what explains why two houses on similar turf sell for different prices.
+
+On the physical side of the house, three patterns dominate. First, interior and exterior condition are extremely valuable. Compared to houses in visibly poor shape, houses in better interior condition sell for about 60K–90K USD more, and houses in worse exterior condition lose about 50K–80K USD in value, even after controlling for size, beds, and baths. That tells you what really clears in Philly’s for-sale market: buyers are paying for “move-in ready and looks solid from the street,” not just square footage. Bathrooms also carry a strong premium — roughly 13K USD per additional bath — which fits a story about livability and privacy. Bedrooms are trickier. Once you control for total living area, an extra bedroom actually correlates with slightly lower sale price. The way to read that is not “buyers hate bedrooms,” but “for two houses of the same size, the one chopped into more/smaller bedrooms can actually feel tighter and cheaper.” In Philadelphia’s rowhome housing stock — especially entry-level rehab product — that’s common: developers carve an extra bedroom into the same envelope, but buyers still value openness. Living area itself is priced at about 37 USD per additional square foot, which is a clean, intuitive slope: more usable space is still worth more money, but not all square footage is created equal if the layout feels cramped.
+
+We also see localized social and environmental factors priced in, even within the same neighborhood. More violent incidents within roughly two blocks (about 600 feet) are associated with lower sale prices, on the order of tens of USD per additional incident. That might sound small per incident, but block-to-block differences add up, and the key point is this survives neighborhood fixed effects. In other words, even inside a neighborhood that’s broadly considered “high crime,” buyers still distinguish between a quieter block and a hotter corner. Meanwhile, access-style amenities like distance to parks, distance to schools, and nearby food retailers don’t come through as statistically meaningful once you control for neighborhood. That suggests those amenities are already baked into which neighborhood you’re in; they’re not the reason one house sells higher than the nearly identical house down the street. Said differently: once you’re in that neighborhood market, hyperlocal safety matters more than marginal proximity to a park.
+
+Finally, the model captures social context at the tract level — income, race, age structure — and those patterns are uncomfortable but real. Houses in tracts with higher median household income tend to sell for more, even within the same neighborhood bucket, which says that micro-areas of relative affluence inside a neighborhood command a premium. The share of Black residents in the tract is associated with lower sale prices, holding physical quality, crime, and everything else constant. That is not a story about “house quality”; that’s a story about how the market (buyers, lenders, appraisers) continues to discount majority-Black areas. This is consistent with persistent racialized valuation in U.S. housing markets. We also see a positive association with the share of seniors (65+): blocks with more older residents tend to have slightly higher sale prices, which likely proxies for stability — long-term owner occupancy, less churn, and “quiet” blocks. These demographic effects are all still happening inside neighborhoods, which means buyers are sensitive to the social micro-geography of a block or tract, not just its ZIP code.
+
+One last anchor in the model is assessed market value. The city’s assessed value is extremely predictive of the actual sale price, at about 0.85 USD on the dollar. That does two things. First, it soaks up a lot of residual variation in quality — finishes, block vibe, unseen mechanical upgrades — that isn’t fully captured by our other variables. Second, it explains why the model fit is so strong (R² ≈ 0.93 overall, ~0.82 within neighborhoods): once you hold neighborhood fixed effects and you include what the city thinks the house is worth, you’ve basically captured both the structural story and the local market story. So the way to interpret this model is: inside a given Philadelphia neighborhood market, buyers pay a lot for finish and condition, they reward livable layouts and bathrooms, they discount safety risk on your immediate block, and they still respond to coded neighborhood status signals — income, racial composition, and perceived block stability — even after we’ve neutralized broad “which neighborhood are you in?” differences.
+
+---
+
+### Part 5: Model Diagnostics
+
+**Diagnostic 1: Residual Plot**
+
+```{r}
+# Residual Plot
+clean_data$residuals <- residuals(lm_model4)
+clean_data$fitted <- fitted(lm_model4)
+
+ggplot(clean_data, aes(x = fitted, y = residuals)) +
+  geom_point() +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Residual Plot", x = "Fitted Values", y = "Residuals") +
+  theme_minimal()
+```
+
+**Interpretation:** random scatter in the residual plot indicates that the model
+is not missing anything systematic (i.e. biased predictions in predictable ways)
+
+```{r}
+
+# Breusch-Pagan Test for Heteroskedacity
+library(lmtest)
+bptest(lm_model4)
+```
+
+**Interpretation:** while the small p-value is evidence of heteroskedacity, we
+have already added a large number of hedonic variables + spatial variables +
+neighborhood fixed effects. Hence, we acknowledge heteroskedacity as a
+limitation of our model because we are focused on point prediction rather than
+inference or confidence intervals.
+
+**Diagnostic 2: Q-Q Plot**
+
+```{r}
+# Plot Q-Q Plot to test Normality of Residuals
+q <- ggplot(clean_data, aes(sample = residuals)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot of Residuals in House Price Prediction",
+       x = "Theoretical Quantiles",
+       y = "Sample Quantiles") +
+  theme_minimal()
+
+print(q)
+
+```
+
+**Interpretation:** the Q-Q plot above shows that points generally fall close to
+the diagonal line. However, the ends (both left and right tails) curve sharply
+away from the diagonal line. This suggests that residuals have heavy tails —
+i.e., there are more extreme outliers than what would be expected under a normal
+distribution, which makes sense for home prices given that luxury home sales
+could skesw the model.
+
+**Diagnostic 3: Cook's Distance**
+
+```{r}
+# Add diagnostic measures to tibble
+diagnostic_data <- augment(lm_model4, data = clean_data) |> 
+  mutate(
+    cooks_d = .cooksd,
+    leverage = .hat,
+    is_influential = cooks_d > 4/nrow(clean_data)
+  )
+
+# Plot Cook's distance
+ggplot(diagnostic_data, aes(x = 1:nrow(diagnostic_data), y = cooks_d)) +
+  geom_point(aes(color = is_influential), size = 2) +
+  geom_hline(yintercept = 4/nrow(diagnostic_data), 
+             linetype = "dashed", color = "red") +
+  scale_color_manual(values = c("grey60", "red")) +
+  labs(title = "Cook's Distance",
+       x = "Observation", y = "Cook's D") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+# Rule of thumb: Cook's D > 4/n
+threshold <- 4/nrow(clean_data)
+
+influential <- diagnostic_data |>
+  filter(cooks_d > threshold)  |>
+  select(age, baths, beds, mkt_value, liv_area, sale_price, neigh, cooks_d) |>
+  arrange(desc(cooks_d))
+
+head(influential, 10)
+```
+
+**Interpretation:** Overall, the vast majority of observations have very low
+Cook's D values and are clustered close to 0. However, there a small number of
+outliers that lie above the horizontal line (i.e. the rule-of-thumb threshold).
+As shown in the table above, these outliers are legitimate sale transactions
+because they have large livable areas and are located in premium neighborhoods
+such as Rittenhouse, Old City, and Chestnut Hill. It is still important to note
+that these outliers are influential and can potentially skew coefficients.
+
+---
+
+### Part 6: Conclusions & Recommendations
+
+**What is your final model's accuracy?**
+
+We tested four models and watched how prediction quality improved as we layered in more information.
+
+  - Structural only (beds, baths, square footage, age, condition): RMSE ≈ 136,000 USD.
+  - + Spatial context (parks, schools, food access, neighborhood socioeconomic stats, crime): RMSE ≈ 108,000 USD.
+  - + Neighborhood fixed effects (absorbing neighborhood differences directly): RMSE ≈ 93,000 USD.
+  - + Collapsing small neighborhoods + adding assessed market value: RMSE ≈ 65,000 USD.
+
+So the final model — the “Small Neighborhoods + Mkt Value” spec — cuts average error almost in half compared to the basic structural model (136K → 65K USD). That’s a huge jump. This tells us two things. First, house-level physical traits are not enough to explain price in Philly. Second, you get massive gains in accuracy from (a) knowing where in the city the house is, down to the neighborhood and even the block, and (b) using the city’s own market assessment as a kind of summary of unobserved quality. The final model is accurate enough to be useful for price benchmarking and valuation discussions, not just academic pattern-finding.
+
+Also look at R²: it climbs from about 0.67 in the structural model to ~0.92 in the final model. That means we’re capturing ~92% of the variation in sale prices with publicly available data plus neighborhood controls.
+
+**Which features matter most for Philadelphia prices?**
+
+- Physical livability: Interior condition has a massive effect: “better interior” categories add on the order of tens of thousands of USD relative to poor interior condition. Exterior condition works the same direction but in reverse: worse exterior knocks off large chunks of value (often 50K–80K USD less). Bathrooms are also very valuable — adding one more bathroom is associated with roughly +13K USD, holding other things constant. Living area matters too: each additional square foot of livable space sells for ~37 USD.
+
+- Layout quality, not just bedroom count: More bedrooms is not automatically “more expensive.” After controlling for total livable area, additional bedrooms are actually associated with lower prices. The story there: if two houses are the same size, the one chopped into more (smaller) bedrooms is viewed as less desirable. Buyers want usable, open-feeling space, not just “4BR” on paper. Basements in usable form, on the other hand, usually add value, and in some categories that bump is >10K USD.
+
+- Immediate block conditions (social environment): Violent incidents within roughly two blocks (≈600 ft) are priced in. Every additional violent incident nearby lowers the sale price. That’s not just “bad neighborhood vs good neighborhood,” because we absorb neighborhood fixed effects — this is within-neighborhood, block-level safety perception. So buyers are discounting homes on hotter corners, even if they’re still in an otherwise desirable area.
+
+- Neighborhood market position / wealth signals: Median household income in the tract is positively associated with higher sale prices, and assessed market value from the city is extremely predictive (roughly 0.85 USD of sale price per 1 USD of assessed value). That basically means: if the assessor thinks you’re a high-value property, the market mostly agrees. A decent chunk of “finish quality,” “renovation level,” and “this is a block that’s turning” is being captured through that single variable.
+
+**Which neighborhoods are hardest to predict?**
+
+```{r}
+#| label: resid-maps
+#| fig-width: 12
+#| fig-height: 8
+#| warning: false
+#| message: false
+
+neigh_url <- "https://raw.githubusercontent.com/opendataphilly/open-geo-data/refs/heads/master/philadelphia-neighborhoods/philadelphia-neighborhoods.geojson"
+neigh <- sf::read_sf(neigh_url)
+
+# make sure neigh has a character neighborhood name column we can join on
+# most Philly neighborhood layers use NAME
+if (!"NAME" %in% names(neigh)) {
+  stop("Neighborhood layer is missing NAME column; inspect `names(neigh)`.")
+}
+
+############################################################
+# 1. Add per-model predictions & residuals to clean_data
+############################################################
+
+clean_data <- clean_data %>%
+  mutate(
+    pred_m1  = predict(cv_m1, newdata = clean_data),
+    resid_m1 = sale_price - pred_m1,
+    pred_m2  = predict(cv_m2, newdata = clean_data),
+    resid_m2 = sale_price - pred_m2,
+    pred_m4  = predict(cv_m4, newdata = clean_data),
+    resid_m4 = sale_price - pred_m4,
+    pred_m5  = predict(cv_m5, newdata = clean_data),
+    resid_m5 = sale_price - pred_m5,
+    pred_m6  = predict(cv_m6, newdata = clean_data),
+    resid_m6 = sale_price - pred_m6
+  )
+
+# standardize neighborhood name text in the sales rows
+clean_data_std <- clean_data %>%
+  mutate(
+    neigh = neigh %>%
+      as.character() %>%
+      str_trim()
+  )
+
+############################################################
+# 2. Collapse residuals to neighborhood-level stats
+############################################################
+
+neigh_resid_long <- clean_data_std %>%
+  select(neigh, starts_with("resid_")) %>%
+  pivot_longer(
+    cols = starts_with("resid_"),
+    names_to = "model",
+    values_to = "resid"
+  ) %>%
+  mutate(
+    # keep only the models we care about
+    model = factor(
+      model,
+      levels = c("resid_m1", "resid_m2", "resid_m4", "resid_m5", "resid_m6"),
+      labels = c("Model 1", "Model 2", "Model 4", "Model 5", "Model 6")
+    )
+  ) %>%
+  filter(!is.na(model)) %>%  # drop any others
+  group_by(neigh, model) %>%
+  summarise(
+    n_sales    = n(),
+    mean_res   = mean(resid, na.rm = TRUE),                     # avg under/over
+    median_res = median(resid, na.rm = TRUE),
+    rmse_res   = sqrt(mean(resid^2, na.rm = TRUE)),
+    .groups    = "drop"
+  )
+
+############################################################
+# 3. Join neighborhood stats back to neighborhood polygons
+############################################################
+
+neigh_map_all <- neigh %>%
+  mutate(
+    neigh = NAME %>%
+      as.character() %>%
+      str_trim()
+  ) %>%
+  left_join(neigh_resid_long, by = "neigh")
+
+# neigh_map_all is now sf with columns:
+# neigh, model, mean_res, etc.
+
+############################################################
+# 4. Helper: map residuals for ONE model
+#    - dynamic symmetric color scale per model
+#    - simple title (Model 1, etc), no subtitle in panels
+############################################################
+
+plot_neigh_residual_map <- function(model_label, na_col = "grey90") {
+
+  df <- neigh_map_all %>% filter(model == model_label)
+
+  # symmetric color limit per model
+  lim_sym <- max(abs(df$mean_res), na.rm = TRUE)
+  if (!is.finite(lim_sym) || lim_sym <= 0) {
+    lim_sym <- NA_real_
+  }
+
+  ggplot(df) +
+    geom_sf(
+      aes(fill = mean_res),
+      color = "grey40",
+      linewidth = 0.2
+    ) +
+    scale_fill_gradient2(
+      name      = "Mean residual (USD)",
+      low       = "#a4133c",
+      mid       = "white",
+      high      = "#1a759f",
+      midpoint  = 0,
+      limits    = if (is.finite(lim_sym)) c(-lim_sym, lim_sym) else waiver(),
+      oob       = squish,
+      na.value  = na_col,
+      labels    = dollar
+    ) +
+    labs(
+      title = model_label,
+      x = NULL,
+      y = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", size = 12, hjust = 0),
+      axis.text        = element_blank(),
+      axis.ticks       = element_blank(),
+      legend.position  = "right"
+    )
+}
+
+############################################################
+# 5. Build panels for each model (dropping Model 3)
+############################################################
+
+p_model1 <- plot_neigh_residual_map("Model 1")
+p_model2 <- plot_neigh_residual_map("Model 2")
+p_model4 <- plot_neigh_residual_map("Model 4")
+p_model5 <- plot_neigh_residual_map("Model 5")
+p_model6 <- plot_neigh_residual_map("Model 6")
+
+blank_panel <- ggplot() + theme_void()
+
+############################################################
+# 6. Assemble patchwork figure (2x3 grid layout)
+############################################################
+
+resid_maps_all <-
+  (p_model1 | p_model2 | p_model4) /
+  (p_model5 | p_model6 | blank_panel) +
+  plot_annotation(
+    title = "Which Neighborhoods Are Hardest to Predict?",
+    subtitle = paste(
+      "Mean model residual (USD) by neighborhood.",
+      "Blue = model underpredicts (homes sold for MORE than predicted).",
+      "Red = model overpredicts (homes sold for LESS).",
+      sep = "\n"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 16, hjust = 0),
+      plot.subtitle = element_text(size = 11, hjust = 0)
+    )
+  ) &
+  theme(
+    legend.key.height = unit(0.4, "in"),
+    legend.key.width  = unit(0.15, "in")
+  )
+
+############################################################
+# 7. Print final figure for the slide
+############################################################
+
+print(resid_maps_all)
+```
+
+
+**Equity concerns?**
+
+Yes, and they show up in the coefficients. Even after controlling for interior quality, exterior condition, square footage, bathroom count, crime on the block, and neighborhood fixed effects, properties in areas with a higher share of Black residents tend to sell for less. That is not a physical-quality story — we already held physical quality constant. It’s also not just “this is a cheaper neighborhood,” because neighborhood fixed effects are in there. It’s evidence of structural discounting: the same basic housing form is being valued lower in Blacker areas.
+
+We also see that tracts with higher median household income sell for more, and tracts with more older residents (65+) sell for more. You can read that as the market attaching a price premium to “social stability” or “aging, long-tenure homeowners with resources,” and a penalty to neighborhoods racialized as lower-value. That has obvious fair housing implications. If you used a model like this to “objectively” value collateral for lending or tax assessment without adjustments, you’d be baking those disparities directly into policy. In other words, the market is not just pricing bricks and bathrooms; it’s pricing neighborhood identity — including race and class — and we can see it in the data.
+
+**Limitations?**
+
+- We model sale price, not willingness to pay in general. Off-market transfers, distressed sales, family transfers, or cash flips at weird prices all exist and can leak into the data. We tried to filter out some non-arm’s-length / broken records using safeguards like price-per-square-foot ranges and value_multiple cutoffs, but it’s not perfect.
+
+- We don’t observe interiors the way an appraiser or buyer does. “Interior condition” is categorical and crude. It does a lot of work in the model, but it’s still way less detailed than listing photos, finishes, HVAC age, roof age, etc. So some of what shows up in the assessed market value term is just “good renovation quality we didn’t explicitly encode.”
+
+- Timing and direction of causality. Crime is measured during 2023–2024, and we’re relating that to sales in roughly that same window. Buyers react to reputation and perceived safety, not just the literal last 12 months of incidents. So the coefficient on violent_2blocks is “areas that are known to be hotter tend to sell for less,” not “if one assault happens on your block today, you instantly lose X USD tomorrow.”
+
+- Demographic variables are structurally loaded. The fact that pct_black is negatively associated with price is not a statement about intrinsic property value. It’s capturing systemic bias — lending, appraisal, speculative expectations — and we’re treating that as a “feature.” That’s useful for prediction, but dangerous for policy if used naively. You would not want to bake that into automated valuation tools without guardrails, because it would literally encode discrimination.
+
+- Fixed effects hide macro gap but don’t solve it. Neighborhood fixed effects let us ask “why does this house sell for more than that house within the same neighborhood?” That’s exactly what we want for local pricing. But fixed effects also absorb neighborhood-level disparities themselves. That means we’re not modeling why one neighborhood as a whole appraises lower than another neighborhood, which is also an equity question — we’re holding that gap constant.
+
+**Declaration**
+ChatGPT was used to amend language errors and allow for more seamless sentence structure/syntax. It was also used to aid in certain repetitive coding tasks. All of which were double checked for accuracy and at times redone by another team member to ensure ownership of both content and code.

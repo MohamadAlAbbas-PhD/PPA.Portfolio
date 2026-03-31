@@ -1,0 +1,1714 @@
+---
+title: "Predicting Eviction Filings in Philadelphia"
+subtitle: "Spatially and Temporally-Lagged Risk Modeling for Housing Policy"
+author: "Mohamad AlAbbas, Jed Chew, Jun Luu & Mark Deng"
+date: today
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+::: {.callout-note appearance="minimal"}
+**Course:** MUSA 5080 — Geospatial Machine Learning for Urban Planning, University of Pennsylvania
+**Portfolio:** [mohamadalabbas-phd.github.io](https://mohamadalabbas-phd.github.io)
+**Summary:** Combines eviction records, 311 service requests, crime incidents, and tax delinquency data to build a spatially and temporally-lagged predictive model of eviction filing risk across Philadelphia census tracts.
+:::
+
+# Executive Summary:
+
+This final project develops a predictive model to identify which Philadelphia census tracts are most at risk for future eviction filings. Using tract-level eviction data from 2020–2025, combined with socioeconomic indicators from ACS data, crime metrics, and 311 complaints, we constructed a monthly panel dataset and applied both time-based and spatial cross-validation to rigorously evaluate model performance.
+
+Across all model specifications, the Poisson model with temporal and spatial lags emerged as the strongest and most stable predictor of out-of-sample eviction activity. While it largely provides a reliable tool for forecasting where eviction interventions may be most urgently needed, there are a number of census tracts with significantly higher prediction errors that require more targeted analysis and site-specific support.
+
+------------------------------------------------------------------------
+
+# Technical Appendix
+
+## 0.0 \| Setup
+
+### 0.1 \| Summon Libraries
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+# ----------------------------
+# Libraries + global settings
+# ----------------------------
+
+# Core
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(stringr)
+library(scales)
+library(here)
+library(broom)
+library(dplyr)
+library(stringr)
+library(patchwork)
+library(tidyr)
+
+# Census / boundaries
+library(tigris)
+library(tidycensus)
+
+# Spatial analysis + features
+library(spdep)
+library(classInt)
+
+# Models
+library(MASS)       # for negative binomial (glm.nb)
+
+# API / web data
+library(httr2)
+library(riem)       # ASOS weather
+
+# Viz
+library(viridis)    # palettes for ggplot
+library(viridisLite)
+library(patchwork)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(gganimate)
+library(classInt)
+library(ggcorrplot)
+
+# Make numbers behave
+options(scipen = 999)
+
+options(tigris_use_cache = TRUE)
+
+select <- dplyr::select
+```
+
+### 0.2 \| Setting Themes
+
+```{r}
+#| label: themes
+#| message: false
+#| warning: false
+
+# ── Visual Themes ─────────────────────────────────────────────────────────────
+plotTheme <- theme(
+  plot.title       = element_text(size = 14, face = "bold"),
+  plot.subtitle    = element_text(size = 11, color = "grey40"),
+  plot.caption     = element_text(size = 8,  color = "grey55", hjust = 1),
+  axis.text        = element_text(size = 9),
+  axis.title       = element_text(size = 10, face = "bold"),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "#fafafa", color = NA),
+  plot.background  = element_rect(fill = "white",   color = NA),
+  legend.title     = element_text(size = 9,  face = "bold"),
+  legend.text      = element_text(size = 8)
+)
+
+mapTheme <- theme_void() +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold"),
+    plot.subtitle   = element_text(size = 11, color = "grey40"),
+    plot.caption    = element_text(size = 8,  color = "grey55", hjust = 1),
+    legend.title    = element_text(size = 9,  face = "bold"),
+    legend.text     = element_text(size = 8),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+palette5 <- c("#f0f9e8", "#bae4bc", "#7bccc4", "#43a2ca", "#0868ac")
+
+# ----------------------------
+# CRS defaults (Philadelphia)
+# ----------------------------
+
+wgs84 <- 4326
+```
+
+```{r census key}
+#| include: false
+
+census_api_key("fe841b7ef0aa73d9579f0517bd1c8f26d33c789b")
+```
+
+## 1.0 \| Data Processing
+
+**Philadelphia Eviction Data:** We retrieved Philadelphia eviction data for 2020-2025 from the Eviction Lab on December 1, 2025
+
+-   <https://evictionlab.org/eviction-tracking/philadelphia-pa/>
+-   <https://evictionlab.org/eviction-tracking/get-the-data/>
+
+**Philadelphia Crime Data:** We retrieved Philadelphia crime data for 2020 from Open Data Philly on December 1, 2025
+
+-   [https://opendataphilly.org/datasets/crime-incidents/https://opendataphilly.org/datasets/crime-incidents/](https://opendataphilly.org/datasets/crime-incidents/)
+
+**Philadelphia Tax Data:** We retrieved Philadelphia real estate tax balances data by Census Tract from Open Data Philly on December 1, 2025. Tax delinquencies are accounts with outstanding balances for previous tax years. This tax balance data is aggregated by zip code, by council district, or by census tract.
+
+-   <https://opendataphilly.org/datasets/real-estate-tax-balances/>
+
+### 1.1 \| Load Data
+
+```{r}
+#| label: load-ev-crim
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+# ----------------------------
+# Data imports (local + 311)
+# ----------------------------
+crime <- read_csv("data/Crime.csv", show_col_types = FALSE)
+evictions <- read_csv("data/philadelphia_monthly_2020_2021.csv", show_col_types = FALSE)
+tax <- read_csv("data/real_estate_tax_balances_census_tract.csv", show_col_types = FALSE)
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+# --- 311 URLs (download + cache as csv files in /data) ---
+urls_311 <- c(
+  "https://phl.carto.com/api/v2/sql?filename=public_cases_fc&format=csv&skipfields=cartodb_id,the_geom,the_geom_webmercator&q=SELECT%20*%20FROM%20public_cases_fc%20WHERE%20requested_datetime%20%3E=%20%272020-01-01%27%20AND%20requested_datetime%20%3C%20%272021-01-01%27",
+  "https://phl.carto.com/api/v2/sql?filename=public_cases_fc&format=csv&skipfields=cartodb_id,the_geom,the_geom_webmercator&q=SELECT%20*%20FROM%20public_cases_fc%20WHERE%20requested_datetime%20%3E=%20%272021-01-01%27%20AND%20requested_datetime%20%3C%20%272022-01-01%27",
+  "https://phl.carto.com/api/v2/sql?filename=public_cases_fc&format=csv&skipfields=cartodb_id,the_geom,the_geom_webmercator&q=SELECT%20*%20FROM%20public_cases_fc%20WHERE%20requested_datetime%20%3E=%20%272022-01-01%27%20AND%20requested_datetime%20%3C%20%272023-01-01%27",
+  "https://phl.carto.com/api/v2/sql?filename=public_cases_fc&format=csv&skipfields=cartodb_id,the_geom,the_geom_webmercator&q=SELECT%20*%20FROM%20public_cases_fc%20WHERE%20requested_datetime%20%3E=%20%272023-01-01%27%20AND%20requested_datetime%20%3C%20%272024-01-01%27",
+  "https://phl.carto.com/api/v2/sql?filename=public_cases_fc&format=csv&skipfields=cartodb_id,the_geom,the_geom_webmercator&q=SELECT%20*%20FROM%20public_cases_fc%20WHERE%20requested_datetime%20%3E=%20%272024-01-01%27%20AND%20requested_datetime%20%3C%20%272025-01-01%27",
+  "https://phl.carto.com/api/v2/sql?filename=public_cases_fc&format=csv&skipfields=cartodb_id,the_geom,the_geom_webmercator&q=SELECT%20*%20FROM%20public_cases_fc%20WHERE%20requested_datetime%20%3E=%20%272025-01-01%27%20AND%20requested_datetime%20%3C%20%272026-01-01%27"
+)
+
+read_311 <- function(u) {
+  read_csv(
+    u,
+    show_col_types = FALSE,
+    col_types = cols(
+      zipcode = col_character()  # <- force consistency
+    )
+  )
+}
+
+phl_311 <- map_dfr(urls_311, read_311)
+```
+
+### 1.2 \| Cleaning 311 Data & Retaining things
+
+**Goal:** clean 311 data and create a small set of “eviction-relevant” 311 indicators.
+
+-   311 requests can proxy neighborhood disorder, housing disrepair, and code enforcement activity that plausibly relate to housing instability and eviction risk
+-   Method: we select 311 calls that are related to potential determinants of eviction filings such as housing conditions and sanitation issues. We then group these calls into 5 intuitive buckets.
+-   Interpretation: the majority of the 311 calls that our group selected are related to sanitation/neighborhood disorder. In addition, another 36% of these 311 calls are related to housing condition or disrepair.
+
+```{r}
+#| label: Clean_311_Data
+#| message: false
+#| warning: false
+
+# 1) Drop records without coordinates
+# We cannot map or spatially join requests (to tracts, buffers, etc.) without lat/lon.
+phl_311 <- phl_311 %>%
+  filter(!is.na(lat), !is.na(lon))
+
+# 2) Keep only 311 subjects that plausibly reflect eviction determinants
+# These keywords target: housing conditions, sanitation/disorder, safety hazards, homelessness,
+# and COVID-era rental stress. (This is a transparent, rule-based filter.)
+keep_patterns <- c(
+  "Maintenance", "Maintenance Complaint",
+  "Construction Complaints",
+  "Sanitation", "Rubbish", "Recycling", "Illegal Dumping",
+  "Dangerous Building", "Right of Way Unit",
+  "Smoke Detector", "Fire Safety",
+  "Homeless",
+  "COVID-19 Rental Assistance", "Rental Assistance", "COVID-19"
+)
+
+phl_311_eviction_relevant <- phl_311 %>%
+  filter(str_detect(subject, str_c(keep_patterns, collapse = "|")))
+
+# 3) Collapse many subject strings into a few interpretable buckets
+# This reduces noise (and the number of categories) so the features are model-friendly.
+phl_311_eviction_relevant <- phl_311_eviction_relevant %>%
+  mutate(evict_bucket = case_when(
+    str_detect(subject, "Maintenance|Construction") ~ "Housing condition / disrepair",
+    str_detect(subject, "Dangerous Building|Right of Way Unit|Licen") ~ "Code enforcement / L&I",
+    str_detect(subject, "Sanitation|Rubbish|Recycling|Illegal Dumping|Dumpster") ~ "Sanitation / neighborhood disorder",
+    str_detect(subject, "Smoke Detector|Fire Safety") ~ "Safety hazards",
+    str_detect(subject, "Homeless") ~ "Housing insecurity signals",
+    str_detect(subject, "COVID-19|Rental Assistance") ~ "COVID-era rental stress",
+    TRUE ~ "Other"
+  ))
+
+# 4) Tabulate the resulting buckets for a quick sanity check
+# This tells us whether we have enough volume in each category to use as predictors later.
+phl_311_eviction_relevant %>%
+  count(evict_bucket, sort = TRUE) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)) %>%
+  kable(
+    col.names = c("Eviction-relevant 311 bucket", "Count", "Share"),
+    align = c("l", "r", "r"),
+    digits = 0
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### 1.3 \| Cleaning Crime Data
+
+**Goal:** classify crime data into violent and non-violent crimes based on keywords
+
+```{r}
+#| label: Clean_Crime
+#| message: false
+#| warning: false
+
+# 1) Drop rows missing coordinates (lat and/or lng)
+crime <- crime %>%
+  filter(!is.na(lat), !is.na(lng))
+
+# If your lat/lng are sometimes empty strings (not NA), also do:
+crime <- crime %>%
+  filter(lat != "", lng != "")
+
+# Violent vs non-violent classification (simple rule list)
+violent_codes <- c(
+  "Homicide - Criminal",
+  "Homicide - Justifiable",
+  "Rape",
+  "Robbery Firearm",
+  "Robbery No Firearm",
+  "Aggravated Assault Firearm",
+  "Aggravated Assault No Firearm",
+  "Other Assaults"
+)
+
+crime <- crime %>%
+  mutate(violent = if_else(text_general_code %in% violent_codes, 1L, 0L))
+```
+
+### 1.4 \| Cleaning Tax Data
+
+```{r}
+#| label: Clean_Tax
+#| message: false
+#| warning: false
+
+# ----------------------------
+# Tax delinquency: prep + harmonize GEOIDs
+# ----------------------------
+tax_clean <- tax %>%
+  transmute(
+    GEOID = str_pad(as.character(census_tract), width = 11, side = "left", pad = "0"),
+    tax_num_props   = as.numeric(num_props),
+    tax_avg_balance = as.numeric(avg_balance),
+    tax_penalty     = as.numeric(penalty)
+  ) %>%
+  group_by(GEOID) %>%
+  summarise(
+    tax_num_props   = sum(tax_num_props,   na.rm = TRUE),
+    tax_avg_balance = mean(tax_avg_balance, na.rm = TRUE),
+    tax_penalty     = sum(tax_penalty,     na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### 1.5 \| Import Census Data
+
+```{r}
+#| label: Load_Census_ACS
+#| message: false
+#| warning: false
+#| progress: false
+
+acs_year <- 2023
+
+# ------------------------------------------------------------
+# 0) Canonical Evictions Panel (monthly GEOID x month_date)
+#    - Produces: evict_panel_lags_complete used later in modeling.
+# ------------------------------------------------------------
+
+# Detect which filings columns exist (wide-by-year format)
+filing_cols <- intersect(
+  c("filings_2020","filings_2021","filings_2022","filings_2023","filings_2024","filings_2025"),
+  names(evictions)
+)
+
+# Build a single monthly "filings" column
+if (length(filing_cols) > 0) {
+  evict_panel <- evictions %>%
+    dplyr::select(GEOID, month, all_of(filing_cols)) %>%
+    mutate(
+      GEOID      = as.character(GEOID),
+      month_date = mdy(month),
+      filings    = rowSums(across(all_of(filing_cols)), na.rm = TRUE)
+    ) %>%
+    dplyr::select(GEOID, month_date, filings)
+} else {
+  # Fallback: if the file is already long, try common names
+  evict_panel <- evictions %>%
+    mutate(
+      GEOID      = as.character(GEOID),
+      month_date = mdy(month),
+      filings    = as.numeric(coalesce(.data$filings, .data$filings_total, .data$evictions, .data$count))
+    ) %>%
+    dplyr::select(GEOID, month_date, filings)
+}
+
+evict_panel <- evict_panel %>%
+  filter(!is.na(month_date)) %>%
+  arrange(GEOID, month_date)
+
+# Ensure complete monthly sequence within tract (so lag_12m means 12 months)
+evict_panel <- evict_panel %>%
+  group_by(GEOID) %>%
+  tidyr::complete(
+    month_date = seq(min(month_date, na.rm = TRUE),
+                     max(month_date, na.rm = TRUE),
+                     by = "month"),
+    fill = list(filings = 0)
+  ) %>%
+  arrange(month_date) %>%
+  ungroup()
+
+# Temporal lags (1,3,6,12 months)
+evict_panel_lags <- evict_panel %>%
+  group_by(GEOID) %>%
+  arrange(month_date) %>%
+  mutate(
+    lag_1m  = lag(filings, 1),
+    lag_3m  = lag(filings, 3),
+    lag_6m  = lag(filings, 6),
+    lag_12m = lag(filings, 12)
+  ) %>%
+  ungroup()
+
+# Drop months that don't have a full year of lag history
+evict_panel_lags_complete <- evict_panel_lags %>%
+  filter(!is.na(lag_12m))
+```
+
+```{r}
+#| message: false
+#| warning: false
+#| progress: false
+
+# ------------------------------------------------------------
+# 1) Tract-level eviction TOTAL used for EDA maps
+# ------------------------------------------------------------
+evictions_total_by_tract <- evict_panel %>%
+  group_by(GEOID) %>%
+  summarise(evictions_total = sum(filings, na.rm = TRUE), .groups = "drop")
+
+# ------------------------------------------------------------
+# 2) Pull ACS and create tract predictors
+# ------------------------------------------------------------
+vars <- c(
+  total_pop      = "B01003_001",
+  med_hh_income  = "B19013_001",
+  pov_below      = "B17001_002",
+  pov_universe   = "B17001_001",
+  unemployed     = "B23025_005",
+  labor_force    = "B23025_002",
+  renter_occ     = "B25003_003",
+  owner_occ      = "B25003_002",
+  housing_units  = "B25002_001",
+  vacant_units   = "B25002_003",
+  med_gross_rent = "B25064_001",
+  med_home_value = "B25077_001",
+  rent_total     = "B25070_001",
+  rent30_34      = "B25070_007",
+  rent35_39      = "B25070_008",
+  rent40_49      = "B25070_009",
+  rent50plus     = "B25070_010",
+  race_total     = "B02001_001",
+  white_alone    = "B02001_002"
+)
+
+acs_wide <- get_acs(
+  geography = "tract",
+  state = "PA",
+  county = "Philadelphia",
+  year = acs_year,
+  survey = "acs5",
+  variables = vars,
+  geometry = FALSE
+) %>%
+  dplyr::select(GEOID, variable, estimate) %>%
+  tidyr::pivot_wider(names_from = variable, values_from = estimate)
+
+census_tract <- acs_wide %>%
+  mutate(
+    poverty_rate      = pov_below / pov_universe,
+    unemployment_rate = unemployed / labor_force,
+    renter_share      = renter_occ / (renter_occ + owner_occ),
+    vacancy_rate      = vacant_units / housing_units,
+    rent_burden_30p   = (rent30_34 + rent35_39 + rent40_49 + rent50plus) / rent_total,
+    nonwhite_share    = 1 - (white_alone / race_total)
+  ) %>%
+  dplyr::select(
+    GEOID,
+    total_pop, med_hh_income, med_gross_rent, med_home_value,
+    poverty_rate, unemployment_rate, renter_share, vacancy_rate, rent_burden_30p,
+    nonwhite_share
+  )
+
+# ------------------------------------------------------------
+# 3) Philly tracts geometry
+# ------------------------------------------------------------
+phl_tracts <- tracts(
+  state = "PA",
+  county = "Philadelphia",
+  year = 2020,
+  cb = TRUE,
+  progress_bar = FALSE
+) %>%
+  st_transform(4326)
+
+
+# ------------------------------------------------------------
+# 4) Crime points -> tract counts
+# ------------------------------------------------------------
+crime_sf <- crime %>%
+  filter(!is.na(lat), !is.na(lng), lat != "", lng != "") %>%
+  st_as_sf(coords = c("lng", "lat"), crs = 4326, remove = FALSE)
+
+crime_counts <- st_join(crime_sf, phl_tracts %>% dplyr::select(GEOID), left = FALSE) %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(
+    violent_n    = sum(violent == 1, na.rm = TRUE),
+    nonviolent_n = sum(violent == 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 5) 311 points -> tract counts (eviction-relevant)
+# ------------------------------------------------------------
+phl_311_sf <- phl_311_eviction_relevant %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+calls_311_tract <- st_join(phl_311_sf, phl_tracts %>% dplyr::select(GEOID), left = FALSE) %>%
+  st_drop_geometry() %>%
+  count(GEOID, name = "calls_311")
+```
+
+### 1.6 \| Creating Harmonized Master Data
+
+```{r}
+#| label: harmonized-data
+#| message: false
+#| warning: false
+
+# ------------------------------------------------------------
+# 6) Master tract sf: tract_joined
+# ------------------------------------------------------------
+tract_joined <- phl_tracts %>%
+  left_join(evictions_total_by_tract, by = "GEOID") %>%
+  left_join(crime_counts, by = "GEOID") %>%
+  left_join(calls_311_tract, by = "GEOID") %>%
+  left_join(census_tract, by = "GEOID") %>%
+  left_join(tax_clean, by = "GEOID") %>% 
+  mutate(
+    evictions_total = tidyr::replace_na(evictions_total, 0),
+    violent_n       = tidyr::replace_na(violent_n, 0),
+    nonviolent_n    = tidyr::replace_na(nonviolent_n, 0),
+    calls_311       = tidyr::replace_na(calls_311, 0),
+    tax_num_props   = tidyr::replace_na(tax_num_props, 0),     
+    tax_avg_balance = tidyr::replace_na(tax_avg_balance, 0),   
+    tax_penalty     = tidyr::replace_na(tax_penalty, 0)         
+  )
+```
+
+## 2.0 \| Exploratory Data Analysis
+
+### 2.1 \| Visualization of Eviction, Crimes, and 311 calls
+
+```{r}
+#| label: Maps_Choropleths_Separate
+#| message: false
+#| warning: false
+#| width: 12
+#| height: 7
+
+# Evictions
+ggplot(tract_joined) +
+  geom_sf(aes(fill = evictions_total), color = NA) +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(title = "Evictions (2020–2025 total)", fill = "Filings",
+       subtitle = "Data Source: The Eviction Lab") +
+  mapTheme
+
+# Violent crime
+ggplot(tract_joined) +
+  geom_sf(aes(fill = violent_n), color = NA) +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(title = "Violent crime incidents", fill = "Incidents",
+       subtitle = "Data Source: Open Data Philly") +
+  mapTheme
+
+# Non-violent crime
+ggplot(tract_joined) +
+  geom_sf(aes(fill = nonviolent_n), color = NA) +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(title = "Non-violent crime incidents", fill = "Incidents",
+       subtitle = "Data Source: Open Data Philly") +
+  mapTheme
+
+ggplot(tract_joined) +
+  geom_sf(aes(fill = calls_311), color = NA) +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(title = "311 calls (Eviction-relevant)", fill = "Calls") +
+  mapTheme
+```
+
+::: callout-note
+## Interpretation of Chloropleth Maps
+
+-   **Evictions (2020-25 Total):** Eviction filings are highly concentrated in a small number of census tracts, with especially intense clusters in North and West Philadelphia. Large areas of the city show relatively low eviction activity, highlighting strong spatial inequality in housing instability
+-   **Violent Crime Incidents:** Violent crime is heavily clustered in neighborhoods in North and West Philadelphia, overlapping with many of the same areas that show higher eviction activity
+-   **Non-Violent Crime incidents:** non-violent crime is more broadly distributed across the city
+-   **311 Calls:** 311 calls that were determined as eviction-related proxies are concentrated in central rowhouse neighborhoods and parts of North and West Philadelphia
+:::
+
+### 2.2 \| Bivariate Maps of Eviction and Crime Types
+
+```{r}
+#| label: Maps_Bivariate_Crime_Evictions
+#| message: false
+#| warning: false
+#| progress: false
+#| width: 15
+#| height: 10
+
+# ============================================================
+# 5) Bivariate helper + palette (exact style you like)
+# ============================================================
+make_bivar <- function(sfobj, x, y, n = 3) {
+  xq <- classInt::classIntervals(sfobj[[x]], n, style = "quantile")$brks
+  yq <- classInt::classIntervals(sfobj[[y]], n, style = "quantile")$brks
+  
+  sfobj %>%
+    dplyr::mutate(
+      x_cat = cut(.data[[x]], breaks = xq, include.lowest = TRUE, labels = 1:n),
+      y_cat = cut(.data[[y]], breaks = yq, include.lowest = TRUE, labels = 1:n),
+      bi = paste0(x_cat, "-", y_cat)
+    )
+}
+
+bi_pal <- c(
+  "1-1"="#e8e8e8","2-1"="#b5c0da","3-1"="#6c83b5",
+  "1-2"="#b8d6be","2-2"="#90b2b3","3-2"="#567994",
+  "1-3"="#73ae80","2-3"="#5a9178","3-3"="#2a5a5b"
+)
+
+legend_df <- expand.grid(evict_cat = 1:3, crime_cat = 1:3) %>%
+  dplyr::mutate(bi = paste0(evict_cat, "-", crime_cat))
+
+# ============================================================
+# 6) Map A: Evictions × Violent crime
+# ============================================================
+biv_v <- make_bivar(tract_joined, "evictions_total", "violent_n")
+
+p_bivar_map_v <- ggplot(biv_v) +
+  geom_sf(aes(fill = bi), color = NA) +
+  scale_fill_manual(values = bi_pal, drop = FALSE) +
+  labs(
+    title = "Bivariate choropleth: Evictions & Violent crime",
+    fill = NULL
+  ) +
+  mapTheme +
+  theme(legend.position = "none")
+
+p_bivar_legend_v <- ggplot(legend_df, aes(x = evict_cat, y = crime_cat, fill = bi)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  scale_fill_manual(values = bi_pal, drop = FALSE) +
+  scale_x_continuous(breaks = 1:3, labels = c("Low", "Mid", "High")) +
+  scale_y_continuous(breaks = 1:3, labels = c("Low", "Mid", "High")) +
+  labs(x = "Evictions", y = "Violent crime") +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 9),
+    axis.text  = element_text(size = 8)
+  )
+
+p_bivar_final_v <- p_bivar_map_v +
+  patchwork::inset_element(p_bivar_legend_v, left = 0.66, bottom = 0.02, right = 0.98, top = 0.34)
+
+print(p_bivar_final_v)
+
+# ============================================================
+# 7) Map B: Evictions × Non-violent crime
+# ============================================================
+biv_nv <- make_bivar(tract_joined, "evictions_total", "nonviolent_n")
+
+p_bivar_map_nv <- ggplot(biv_nv) +
+  geom_sf(aes(fill = bi), color = NA) +
+  scale_fill_manual(values = bi_pal, drop = FALSE) +
+  labs(
+    title = "Bivariate choropleth: Evictions & Non-violent crime",
+    fill = NULL
+  ) +
+  mapTheme +
+  theme(legend.position = "none")
+
+p_bivar_legend_nv <- ggplot(legend_df, aes(x = evict_cat, y = crime_cat, fill = bi)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  scale_fill_manual(values = bi_pal, drop = FALSE) +
+  scale_x_continuous(breaks = 1:3, labels = c("Low", "Mid", "High")) +
+  scale_y_continuous(breaks = 1:3, labels = c("Low", "Mid", "High")) +
+  labs(x = "Evictions", y = "Non-violent crime") +
+  theme_minimal(base_size = 9) +
+  theme(
+    legend.position = "none",
+    panel.grid = element_blank(),
+    axis.title = element_text(size = 9),
+    axis.text  = element_text(size = 8)
+  )
+
+p_bivar_final_nv <- p_bivar_map_nv +
+  patchwork::inset_element(p_bivar_legend_nv, left = 0.66, bottom = 0.02, right = 0.98, top = 0.34)
+
+print(p_bivar_final_nv)
+```
+
+::: callout-note
+## Interpretation of Bivariate Maps
+
+-   **Evictions x Violent Crime Incidents:** Many tracts in parts of West and North Philadelphia appear in the darker green range, indicating simultaneously high eviction filings and high violent crime. In contrast, the lighter blue tracts in parts of South, Northwest, and Northeast Philadelphia show low evictions and low violent crime, highlighting strong spatial separation between stable and high-risk neighborhoods
+-   **Evictions x Non-Violent Crime incidents**: broad swaths of the city, especially North and West Philadelphia, are experiencing both high eviction activity and elevated non-violent crime
+:::
+
+### 2.3 \| Variable Histograms
+
+```{r}
+#| label: Histograms_Patchwork
+#| message: false
+#| warning: false
+#| fig-width: 14
+#| fig-height: 10
+
+df <- st_drop_geometry(tract_joined)
+
+p_evict <- ggplot(df, aes(x = evictions_total)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Evictions total (across available months)", x = "Evictions", y = "Tracts") +
+  theme_minimal()
+
+p_v <- ggplot(df, aes(x = violent_n)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Violent Incidents total (across available months)", x = "Violent incidents", y = "Tracts") +
+  theme_minimal()
+
+p_nv <- ggplot(df, aes(x = nonviolent_n)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Non-Violent Incidents total (across available months)", x = "Non-violent incidents", y = "Tracts") +
+  theme_minimal()
+
+p_311 <- ggplot(df, aes(x = calls_311)) +
+  geom_histogram(bins = 30) +
+  labs(title = "311 calls total (across available months)", x = "311 calls", y = "Tracts") +
+  theme_minimal()
+
+(p_evict | p_v) / (p_nv | p_311)
+```
+
+### 2.4 \| Descriptive Statistics
+
+```{r}
+#| label:  Descriptive_Statistics 
+#| message: false
+#| warning: false
+#| fig-width: 14
+#| fig-height: 10
+
+# ------------------------------------------------------------
+# 1) Prep variables
+# ------------------------------------------------------------
+eda_df <- tract_joined %>%
+  mutate(
+    pct_nonwhite = 100 * nonwhite_share,
+    pct_white    = 100 * (1 - nonwhite_share)
+  )
+
+age_cols <- intersect(
+  c("age_u18_share", "age_18_34_share", "age_35_64_share", "age_65plus_share"),
+  names(eda_df)
+)
+
+# ------------------------------------------------------------
+# 2) Summary table: Evictions (tract-level)
+# ------------------------------------------------------------
+evict_summary <- eda_df %>%
+  st_drop_geometry() %>%
+  summarise(
+    n_tracts   = n(),
+    mean       = mean(evictions_total, na.rm = TRUE),
+    sd         = sd(evictions_total, na.rm = TRUE),
+    min        = min(evictions_total, na.rm = TRUE),
+    p25        = quantile(evictions_total, 0.25, na.rm = TRUE),
+    median     = median(evictions_total, na.rm = TRUE),
+    p75        = quantile(evictions_total, 0.75, na.rm = TRUE),
+    max        = max(evictions_total, na.rm = TRUE),
+    share_zero = mean(evictions_total == 0, na.rm = TRUE)
+  ) %>%
+  mutate(share_zero = scales::percent(share_zero, accuracy = 0.1))
+
+evict_summary %>%
+  kable(
+    digits = 2,
+    col.names = c("Tracts", "Mean", "SD", "Min", "P25", "Median", "P75", "Max", "Share zero"),
+    align = "r"
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### 2.5 \| Correlation Analysis of Variables
+
+```{r}
+#| label:  Correlation
+#| message: false
+#| warning: false
+#| fig-width: 14
+#| fig-height: 10
+
+# ------------------------------------------------------------
+# 3) Correlation matrix (kable): RAW evictions + predictors
+# ------------------------------------------------------------
+corr_vars <- c(
+  "evictions_total",
+  "violent_n", "nonviolent_n",
+  "pct_white", "pct_nonwhite",
+  "poverty_rate", "vuln_flag",
+  "calls_311",
+  "med_hh_income", "renter_share", "vacancy_rate", "unemployment_rate", "rent_burden_30p",
+  age_cols
+)
+
+corr_vars <- corr_vars[corr_vars %in% names(eda_df)]
+
+corr_mat <- eda_df %>%
+  st_drop_geometry() %>%
+  dplyr::select(all_of(corr_vars)) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  cor(use = "pairwise.complete.obs")
+
+round(corr_mat, 2) %>%
+  kable(align = "r") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+```{r}
+ggcorrplot(
+  corr_mat,
+  method   = "square",
+  type     = "lower",
+  lab      = TRUE,
+  lab_size = 3,
+  colors   = c("#a4133c", "white", "#a4133c")
+) +
+  labs(title = "Correlation Matrix: Evictions and Neighborhood Variables") +
+  theme(
+    plot.title   = element_text(size = 12, face = "bold"),
+    axis.text.x  = element_text(size = 7, angle = 45, hjust = 1),
+    axis.text.y  = element_text(size = 7),
+    axis.title   = element_text(size = 8)
+  )
+```
+
+::: callout-note
+## Feature Correlation Analysis
+
+-   Evictions are moderately correlated with crime and neighborhood distress (violent crime; non-violent crime; 311 calls; poverty)
+-   Unsurprisingly, race and income show strong structural correlations
+-   Evictions correlate negatively with higher-income and majority-white tracts
+-   However, evictions have weaker relationships with certain housing market indicators such as vacancy rate, rent burden and renter share.
+:::
+
+### 2.6 \| Predictor Relationship Tests
+
+```{r}
+#| label:  Scatter_plots
+#| message: false
+#| warning: false
+#| fig-width: 14
+#| fig-height: 10
+
+# ------------------------------------------------------------
+# 4) Scatterplots ( Evictions vs key predictors) + vuln boxplot
+# ------------------------------------------------------------
+p1 <- ggplot(eda_df, aes(x = violent_n, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs Violent crime", x = "Violent incidents", y = "Evictions (total)") +
+  theme_minimal()
+
+p2 <- ggplot(eda_df, aes(x = nonviolent_n, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs Non-violent crime", x = "Non-violent incidents", y = "Evictions (total)") +
+  theme_minimal()
+
+p3 <- ggplot(eda_df, aes(x = calls_311, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs 311 calls", x = "311 calls (eviction-relevant)", y = "Evictions (total)") +
+  theme_minimal()
+
+p4 <- ggplot(eda_df, aes(x = poverty_rate, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs Poverty rate", x = "Poverty rate", y = "Evictions (total)") +
+  theme_minimal()
+
+p5 <- ggplot(eda_df, aes(x = renter_share, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs Renter share", x = "Renter share", y = "Evictions (total)") +
+  theme_minimal()
+
+p6 <- ggplot(eda_df, aes(x = med_hh_income, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs Median HH income", x = "Median HH income", y = "Evictions (total)") +
+  theme_minimal()
+
+p7 <- ggplot(eda_df, aes(x = pct_nonwhite, y = evictions_total)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Evictions vs % Non-white", x = "% Non-white", y = "Evictions (total)") +
+  theme_minimal()
+
+(p1 | p2) / ( p3 | p4) / ( p5 | p6) / (p7)
+```
+
+::: callout-note
+## Predictor Relationship Scatterplot Analysis
+
+Overall, tracts with overlapping socioeconomic hardship, high crime, and elevated tenant distress consistently exhibit the highest levels of eviction activity.
+
+-   Evictions rise with neighborhood crime levels: Both violent and non-violent crime show clear positive relationships with eviction counts, indicating that high-eviction tracts also tend to experience elevated public-safety challenges.
+-   311 housing-related complaints are strongly associated with evictions, suggesting that tenant distress, building issues, and landlord–tenant conflicts often precede or accompany formal eviction filings.
+-   Poverty rates show a positive upward trend with evictions, reinforcing that economic vulnerability is a core driver of housing instability across Philadelphia neighborhoods.
+-   Higher renter share is linked with more evictions, reflecting the concentration of eviction activity in rental-heavy areas and multifamily neighborhoods.
+-   Median household income has a strong negative relationship with evictions, with wealthier tracts experiencing very few filings and lower-income tracts showing substantially higher counts.
+-   Racial composition (% non-white) shows only a weak direct trend, likely because race is intertwined with other structural factors (income, poverty, neighborhood safety) that more directly predict eviction risk.
+:::
+
+### 2.7 \| Moran's I
+
+```{r}
+#| label: MoransI_Log_vs_Total
+#| message: false
+#| warning: false
+
+ev_sf <- tract_joined %>%
+  mutate(log_evictions = log1p(evictions_total)) %>%
+  filter(!is.na(evictions_total), !is.na(log_evictions))
+
+nb <- poly2nb(ev_sf, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+mi_total <- moran.test(ev_sf$evictions_total, lw, zero.policy = TRUE)
+mi_log   <- moran.test(ev_sf$log_evictions,   lw, zero.policy = TRUE)
+
+moran_tbl <- tibble(
+  variable = c("evictions_total", "log(1 + evictions_total)"),
+  morans_I = c(
+    unname(mi_total$estimate[["Moran I statistic"]]),
+    unname(mi_log$estimate[["Moran I statistic"]])
+  ),
+  expectation = c(
+    unname(mi_total$estimate[["Expectation"]]),
+    unname(mi_log$estimate[["Expectation"]])
+  ),
+  variance = c(
+    unname(mi_total$estimate[["Variance"]]),
+    unname(mi_log$estimate[["Variance"]])
+  ),
+  p_value = c(mi_total$p.value, mi_log$p.value)
+) %>%
+  mutate(
+    morans_I = round(morans_I, 4),
+    expectation = round(expectation, 4),
+    variance = round(variance, 6),
+    p_value = signif(p_value, 3)
+  )
+
+moran_tbl %>%
+  kable(
+    col.names = c("Variable", "Moran's I", "Expectation", "Variance", "p-value"),
+    align = c("l","r","r","r","r")
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+::: callout-note
+## Interpretation of Moran's I
+
+-   **Evictions_total has a Moran’s I of 0.2669 (p \< 0.001), indicating** **moderate and statistically significant spatial autocorrelation**. Eviction counts are not randomly distributed across Philadelphia; instead, tracts with high (or low) eviction totals tend to be located near other tracts with similar levels.
+
+<!-- -->
+
+-   **The log-transformed version (Moran’s I = 0.3010)** shows slightly stronger spatial clustering.
+
+<!-- -->
+
+-   Taken together, these results confirm that **evictions exhibit meaningful spatial structure**, which may warrant incorporating spatial lags and neighborhood fixed effects in predictive models.
+:::
+
+### 2.8 \| LISA Map
+
+```{r}
+#| label: LISA_Evictions_Total
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 7
+
+# ------------------------------------------------------------
+# LISA (Local Moran's I) for TOTAL evictions (evictions_total)
+# ------------------------------------------------------------
+lisa_sf <- tract_joined %>%
+  filter(!is.na(evictions_total))
+
+# Neighbors + weights
+nb <- poly2nb(lisa_sf, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+# Standardize outcome + spatial lag
+z <- as.numeric(scale(lisa_sf$evictions_total))
+lag_z <- lag.listw(lw, z, zero.policy = TRUE)
+
+# Local Moran's I
+lm <- localmoran(z, lw, zero.policy = TRUE)
+
+lisa_sf <- lisa_sf %>%
+  mutate(
+    Ii   = lm[, "Ii"],
+    p_Ii = lm[, "Pr(z != E(Ii))"],
+    quadrant = case_when(
+      z >= 0 & lag_z >= 0 ~ "High-High",
+      z <  0 & lag_z <  0 ~ "Low-Low",
+      z >= 0 & lag_z <  0 ~ "High-Low",
+      z <  0 & lag_z >= 0 ~ "Low-High"
+    ),
+    lisa_cluster = if_else(p_Ii < 0.05, quadrant, "Not significant")
+  )
+
+# Counts table
+lisa_sf %>%
+  st_drop_geometry() %>%
+  count(lisa_cluster, sort = TRUE) %>%
+  kable(col.names = c("LISA cluster (p < 0.05)", "Tracts"), align = c("l","r")) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+
+# Map
+lisa_pal <- c(
+  "High-High"       = "#d7191c",
+  "Low-Low"         = "#2c7bb6",
+  "High-Low"        = "#fdae61",
+  "Low-High"        = "#abd9e9",
+  "Not significant" = "grey85"
+)
+
+ggplot(lisa_sf) +
+  geom_sf(aes(fill = lisa_cluster), color = NA) +
+  scale_fill_manual(values = lisa_pal, drop = FALSE) +
+  labs(
+    title = "LISA clusters: Evictions total (2020–2025)",
+    subtitle = "Local Moran’s I (queen contiguity). Colored only if p < 0.05.",
+    fill = NULL
+  ) +
+  mapTheme
+```
+
+::: callout-note
+## LISA Interpretation
+
+-   **High–High clusters (red)** identify areas where census tracts with high eviction totals are surrounded by other high-eviction tracts. These hotspots are primarily concentrated in West and North Philadelphia
+
+-   **High–Low tracts (orange)** and Low**–High tracts (light blue**) mark spatial outliers. These tracts have eviction levels that differ significantly from their neighbors which may indicate emerging hotspots or places where neighborhood conditions are changing
+:::
+
+## 3.0 \| Feature Engineering
+
+### 3.1 \| Feature: Tract Vulnerability
+
+We use the criteria of minority (share of non-white population \> 50%) and low-income (poverty rate \> 30% tracts to identify tracts that are likely to experience a higher number of eviction filings.
+
+-   **Share of Non-White Population \> 50%:** The Reinvestment Fund's analysis of evictions in Philadelphia has found that census tracts with higher concentrations of non-white residents experience consistently higher eviction filing rates independent of income, tenure mix, or public housing concentrations.
+    -   In 2021, Black Philadelphians faced eviction filings at nearly three times the rate of White residents, and Hispanic tenants also experienced filing rates notably higher than those of White renters
+-   **Poverty Rate \> 30%:** The Reinvestment Fund notes that eviction filings are clustered in the city’s lowest-income neighborhoods, including large sections of North Philadelphia and Southwest Philadelphia.
+    -   Philadelphia’s citywide poverty rate is approximately 24%, meaning that tracts with poverty \>30% are substantially above the baseline average and represent the neighborhoods most structurally vulnerable to eviction pressure
+
+    -   As shown in the table below, 89 census tracts (21.8% of all tracts in Philadelphia) had a poverty rate \>30%
+
+```{r}
+#| label: Vulnerability_Sensitivity_PovertyCutoff
+#| message: false
+#| warning: false
+
+# try a range of poverty cutoffs (edit this vector if you want)
+poverty_grid <- c(0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50)
+
+vuln_sensitivity <- tibble(poverty_cutoff = poverty_grid) %>%
+  rowwise() %>%
+  mutate(
+    vulnerable_tracts = sum(
+      tract_joined$nonwhite_share > 0.50 &
+        tract_joined$poverty_rate > poverty_cutoff,
+      na.rm = TRUE
+    ),
+    share_vulnerable = vulnerable_tracts / nrow(tract_joined)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    share_vulnerable = scales::percent(share_vulnerable, accuracy = 0.1)
+  )
+
+vuln_sensitivity %>%
+  kable(
+    col.names = c("Poverty cutoff", "# Vulnerable tracts", "Share of tracts"),
+    align = c("r", "r", "r")
+  ) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+
+# Here we build a simple vulnerability flag:
+# - majority non-white: nonwhite_share > 0.50
+# - AND high poverty: poverty_rate > poverty_cutoff
+
+poverty_cutoff <- 0.3
+
+tract_joined <- tract_joined %>%
+  mutate(
+    vuln_flag = if_else(
+      nonwhite_share > 0.50 & poverty_rate > poverty_cutoff,
+      1L, 0L
+    )
+  )
+
+ggplot(tract_joined) +
+  geom_sf(aes(fill = factor(vuln_flag)), color = NA) +
+  scale_fill_manual(values = c("0" = "grey85", "1" = "red3"), name = "Vulnerable") + labs(title = "Vulnerability flag (Non-white > 50% + Poverty rate > 30%)") +
+  mapTheme
+```
+
+### 3.2 \| Feature: Distance to Hotspots
+
+**Method:** we first use Local Moran’s I (LISA) on tract-level eviction totals to identify statistically significant High–High (hotspot) and Low–Low (coldspot) clusters of eviction activity.
+
+We then convert each tract to a point (its interior point), and for every tract calculate the minimum distance in kilometers to the nearest High–High tract and to the nearest Low–Low tract; these become dist_hot_km and dist_cold_km.
+
+In the predictive model, these features summarize how close a tract is to eviction hotspots or coldspots, allowing the model to capture spillover effects and spatial dependence in a simple, interpretable way
+
+```{r}
+#| label: Dist_To_LISA_Hot_Cold
+#| message: false
+#| warning: false
+
+# ------------------------------------------------------------
+# 1) Re-create LISA clusters (RAW evictions_total) at tract level
+# ------------------------------------------------------------
+lisa_sf <- tract_joined %>%
+  filter(!is.na(evictions_total)) %>%
+  st_transform(26918)  # UTM 18N (meters) for clean distance calcs
+
+nb <- poly2nb(lisa_sf, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+z     <- as.numeric(scale(lisa_sf$evictions_total))
+lag_z <- lag.listw(lw, z, zero.policy = TRUE)
+
+lm <- localmoran(z, lw, zero.policy = TRUE)
+
+lisa_sf <- lisa_sf %>%
+  mutate(
+    p_Ii = lm[, "Pr(z != E(Ii))"],
+    quadrant = case_when(
+      z >= 0 & lag_z >= 0 ~ "High-High",
+      z <  0 & lag_z <  0 ~ "Low-Low",
+      z >= 0 & lag_z <  0 ~ "High-Low",
+      z <  0 & lag_z >= 0 ~ "Low-High"
+    ),
+    lisa_cluster = if_else(p_Ii < 0.05, quadrant, "Not significant")
+  )
+
+# ------------------------------------------------------------
+# 2) Distance to nearest Hotspot (High-High) and Coldspot (Low-Low)
+# ------------------------------------------------------------
+pts_all  <- st_point_on_surface(lisa_sf)
+
+hot_pts  <- pts_all %>% filter(lisa_cluster == "High-High")
+cold_pts <- pts_all %>% filter(lisa_cluster == "Low-Low")
+
+# helper: min distance to a set of points (returns meters -> km)
+min_dist_km <- function(from_pts, to_pts) {
+  if (nrow(to_pts) == 0) return(rep(NA_real_, nrow(from_pts)))
+  as.numeric(apply(st_distance(from_pts, to_pts), 1, min)) / 1000
+}
+
+lisa_sf <- lisa_sf %>%
+  mutate(
+    dist_hot_km  = min_dist_km(pts_all, hot_pts),
+    dist_cold_km = min_dist_km(pts_all, cold_pts)
+  ) %>%
+  st_transform(4326)  # back to WGS84 so everything stays consistent
+
+# ------------------------------------------------------------
+# 3) Attach distances back onto tract_joined
+# ------------------------------------------------------------
+tract_joined <- tract_joined %>%
+  left_join(
+    lisa_sf %>% st_drop_geometry() %>% select(GEOID, dist_hot_km, dist_cold_km),
+    by = "GEOID"
+  )
+```
+
+### 3.3 \| Feature: Temporal Lags
+
+**Method:** we build a monthly panel of eviction filings by census tract and then create lagged versions of the outcome to represent recent history.
+
+For each GEOID we (1) collapse year-specific filing columns into a single monthly filings count, (2) fill in a complete monthly sequence so time gaps don’t break the lags, and (3) compute lag_1m, lag_3m, lag_6m, and lag_12m, dropping months that don’t yet have a full year of history.
+
+These lag variables let the model learn the persistence and momentum of eviction risk within each tract, which is crucial for forecasting future filings rather than just describing cross-sectional differences at a specific point in time.
+
+```{r}
+#| label: Evictions_Lag_Features
+#| message: false
+#| warning: false
+
+# ------------------------------------------------------------
+# 1) Build a monthly GEOID panel with ONE eviction count column
+#    (uses whatever filings_* columns exist, 2020–2025)
+# ------------------------------------------------------------
+
+# make a single "filings" column by summing all filings_YYYY that exist
+filing_cols <- intersect(
+  c("filings_2020","filings_2021","filings_2022","filings_2023","filings_2024","filings_2025"),
+  names(evictions)
+)
+
+evict_panel <- evictions %>%
+  select(GEOID, month, all_of(filing_cols)) %>%
+  mutate(
+    GEOID = as.character(GEOID),
+    month_date = mdy(month),
+    filings = rowSums(across(all_of(filing_cols)), na.rm = TRUE)
+  ) %>%
+  select(GEOID, month_date, filings) %>%
+  filter(!is.na(month_date)) %>%
+  arrange(GEOID, month_date)
+
+# ------------------------------------------------------------
+# 2) Make sure each GEOID has a complete monthly sequence
+#    (so "lag 12" truly means 12 months)
+# ------------------------------------------------------------
+evict_panel <- evict_panel %>%
+  group_by(GEOID) %>%
+  complete(
+    month_date = seq(min(month_date, na.rm = TRUE),
+                     max(month_date, na.rm = TRUE),
+                     by = "month"),
+    fill = list(filings = 0)
+  ) %>%
+  arrange(month_date) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# 3) Create eviction lags WITHIN GEOID (1, 3, 6, 12 months)
+# ------------------------------------------------------------
+evict_panel_lags <- evict_panel %>%
+  group_by(GEOID) %>%
+  arrange(month_date) %>%
+  mutate(
+    lag_1m  = lag(filings, 1),
+    lag_3m  = lag(filings, 3),
+    lag_6m  = lag(filings, 6),
+    lag_12m = lag(filings, 12)
+  ) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# 4) Drop rows without a full year of lag history (common choice)
+# ------------------------------------------------------------
+evict_panel_lags_complete <- evict_panel_lags %>%
+  filter(!is.na(lag_12m))
+```
+
+## 4.0 \| Prediction & Modeling
+
+### 4.1 \| Modeling Baseline Using Train/Test Data
+
+```{r}
+#| label: Predict_With_Temporal_And_Spatial_Lags_Synced
+#| message: false
+#| warning: false
+
+set.seed(123)
+
+# ------------------------------------------------------------
+# 0) helper functions
+# ------------------------------------------------------------
+mae  <- function(y, yhat) mean(abs(y - yhat), na.rm = TRUE)
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2, na.rm = TRUE))
+pred <- function(m, newdata) as.numeric(predict(m, newdata = newdata, type = "response"))
+pois_disp <- function(m) sum(residuals(m, type = "pearson")^2, na.rm = TRUE) / m$df.residual
+
+# ------------------------------------------------------------
+# 1) Start from your monthly eviction panel WITH lags 
+# ------------------------------------------------------------
+df_time <- evict_panel_lags_complete %>%
+  transmute(
+    GEOID      = as.character(GEOID),
+    month_date = as.Date(month_date),
+    evictions  = as.numeric(filings),
+    lag_1m, lag_3m, lag_6m, lag_12m
+  ) %>%
+  filter(!is.na(month_date), !is.na(evictions))
+
+# ------------------------------------------------------------
+# 2) Join tract-level predictors from tract_joined
+# ------------------------------------------------------------
+cand_x <- c(
+  "violent_n", "nonviolent_n", "calls_311",
+  "poverty_rate", "med_hh_income", "renter_share", "vacancy_rate",
+  "unemployment_rate", "rent_burden_30p", "nonwhite_share", "vuln_flag",
+  "dist_hot_km", "dist_cold_km", "med_gross_rent", "med_home_value",
+  "tax_num_props", "tax_avg_balance", "tax_penalty" 
+)
+
+tract_x <- tract_joined %>%
+  st_drop_geometry() %>%
+  transmute(GEOID = as.character(GEOID), across(any_of(cand_x)))
+
+df_time <- df_time %>% left_join(tract_x, by = "GEOID")
+
+# ------------------------------------------------------------
+# 3) Spatial weights and spatial lags (correct length/order each month)
+# ------------------------------------------------------------
+geoid_keep <- intersect(as.character(tract_joined$GEOID), as.character(df_time$GEOID))
+
+tract_sub <- tract_joined %>%
+  st_drop_geometry() %>%                        # weights only need geometry, but GEOID ordering is key
+  mutate(GEOID = as.character(GEOID)) %>%
+  dplyr::select(GEOID) %>%
+  right_join(
+    tract_joined %>% mutate(GEOID = as.character(GEOID)) %>% filter(GEOID %in% geoid_keep) %>% dplyr::select(GEOID),
+    by = "GEOID"
+  )
+
+# keep geometry for weights
+tract_sub <- tract_joined %>%
+  mutate(GEOID = as.character(GEOID)) %>%
+  filter(GEOID %in% geoid_keep) %>%
+  arrange(GEOID)
+
+nb_sub <- spdep::poly2nb(tract_sub, queen = TRUE)
+lw_sub <- spdep::nb2listw(nb_sub, style = "W", zero.policy = TRUE)
+
+# force every month to have every GEOID (so lw_sub length matches)
+df_time <- df_time %>%
+  filter(GEOID %in% tract_sub$GEOID) %>%
+  tidyr::complete(
+    month_date,
+    GEOID = tract_sub$GEOID,
+    fill = list(
+      evictions = 0,
+      lag_1m = 0, lag_3m = 0, lag_6m = 0, lag_12m = 0
+    )
+  ) %>%
+  arrange(month_date, GEOID)
+
+# compute spatial lags per month in the SAME GEOID order as tract_sub
+df_time <- df_time %>%
+  group_by(month_date) %>%
+  arrange(GEOID, .by_group = TRUE) %>%
+  mutate(
+    slag_evict  = spdep::lag.listw(lw_sub, evictions, zero.policy = TRUE),
+    slag_lag1m  = spdep::lag.listw(lw_sub, lag_1m,   zero.policy = TRUE),
+    slag_lag3m  = spdep::lag.listw(lw_sub, lag_3m,   zero.policy = TRUE),
+    slag_lag6m  = spdep::lag.listw(lw_sub, lag_6m,   zero.policy = TRUE),
+    slag_lag12m = spdep::lag.listw(lw_sub, lag_12m,  zero.policy = TRUE)
+  ) %>%
+  ungroup()
+```
+
+**Training-Test Split for Subsequent Cross-Validation**
+
+-   We use a time-based (forward-chaining) split for forecasting because it respects the temporal ordering of the data and prevents “peeking into the future”
+-   All observations from January 2020 to December 2024 will be used for model training, while all observations in 2025 will be used for testing
+-   **The modeling dataset (`df_model`) includes**:
+    -   The outcome (`evictions` for each tract-month)
+
+    -   Candidate predictors (`cand_x`)
+
+    -   Temporal lags (1, 3, 6, 12 months)
+
+    -   Spatially lagged temporal lags (spillover lags)
+
+```{r}
+# ------------------------------------------------------------
+# 4) Modeling df + time split
+# ------------------------------------------------------------
+cutoff <- as.Date("2025-01-01")
+
+df_model <- df_time %>%
+  dplyr::select(
+    GEOID, month_date, evictions,
+    any_of(cand_x),
+    lag_1m, lag_3m, lag_6m, lag_12m,
+    slag_lag1m, slag_lag3m, slag_lag6m, slag_lag12m
+  ) %>%
+  tidyr::drop_na()
+
+train <- df_model %>% filter(month_date < cutoff)
+test  <- df_model %>% filter(month_date >= cutoff)
+```
+
+**Fit Predictive Models**
+
+Baseline Negative Binomial Model: $$Evictions_{t+1} = \beta_0​+\beta_1​Evictions_t​+\beta_2​X+ϵ$$
+
+```{r}
+# ------------------------------------------------------------
+# 5) Fit models (raw counts only)
+# ------------------------------------------------------------
+x_base <- intersect(cand_x, names(df_model))
+
+x_temp <- c(x_base, "lag_1m","lag_3m","lag_6m","lag_12m")
+x_temp <- intersect(x_temp, names(df_model))
+
+x_tsp  <- c(x_temp,"slag_lag1m","slag_lag3m","slag_lag6m","slag_lag12m")
+x_tsp  <- intersect(x_tsp, names(df_model))
+
+f_base <- as.formula(paste("evictions ~", paste(x_base, collapse = " + ")))
+f_temp <- as.formula(paste("evictions ~", paste(x_temp, collapse = " + ")))
+f_tsp  <- as.formula(paste("evictions ~", paste(x_tsp,  collapse = " + ")))
+
+m_poi_base <- glm(f_base, data = train, family = poisson())
+m_nb_base  <- MASS::glm.nb(f_base, data = train)
+
+m_poi_temp <- glm(f_temp, data = train, family = poisson())
+m_nb_temp  <- MASS::glm.nb(f_temp, data = train)
+
+m_poi_tsp  <- glm(f_tsp,  data = train, family = poisson())
+m_nb_tsp   <- MASS::glm.nb(f_tsp, data = train)
+```
+
+**Model Evaluation (MAE / RMSE)**
+
+```{r}
+# ------------------------------------------------------------
+# 6) Evaluate (MAE / RMSE)
+# ------------------------------------------------------------
+eval_tbl <- tibble(
+  Model = c(
+    "Poisson (baseline)",
+    "NegBin (baseline)",
+    "Poisson (+ temporal lags)",
+    "NegBin (+ temporal lags)",
+    "Poisson (+ temporal + spatial lags)",
+    "NegBin (+ temporal + spatial lags)"
+  ),
+  MAE = c(
+    mae(test$evictions, pred(m_poi_base, test)),
+    mae(test$evictions, pred(m_nb_base,  test)),
+    mae(test$evictions, pred(m_poi_temp, test)),
+    mae(test$evictions, pred(m_nb_temp,  test)),
+    mae(test$evictions, pred(m_poi_tsp,  test)),
+    mae(test$evictions, pred(m_nb_tsp,   test))
+  ),
+  RMSE = c(
+    rmse(test$evictions, pred(m_poi_base, test)),
+    rmse(test$evictions, pred(m_nb_base,  test)),
+    rmse(test$evictions, pred(m_poi_temp, test)),
+    rmse(test$evictions, pred(m_nb_temp,  test)),
+    rmse(test$evictions, pred(m_poi_tsp,  test)),
+    rmse(test$evictions, pred(m_nb_tsp,   test))
+  )
+) %>%
+  mutate(across(c(MAE, RMSE), ~ round(.x, 3)))
+
+eval_tbl %>%
+  kable(align = c("l","r","r")) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover","condensed"))
+```
+
+::: callout-important
+## Interpretation of Prediction Metrics
+
+-   **Baseline Models:** The baseline Poisson (MAE ≈ 1.97, RMSE ≈ 2.84) and baseline Negative Binomial (MAE ≈ 1.98, RMSE ≈ 2.86) perform similarly, meaning that using only static tract-level predictors gives moderate accuracy but cannot capture month-to-month variation.
+-   **Models with Temporal Lags:** Adding lagged eviction counts improves the Poisson model substantially (MAE drops from 1.97 → 1.76; RMSE from 2.84 → 2.53). The Negative Binomial with temporal lags performs worse (RMSE jumps to 3.12), suggesting the NB distribution may over-correct or inflate variance when lags already capture much of the overdispersion.
+-   **Models with Temporal + Spatial Lag Features**
+    -   Adding spatially lagged temporal predictors yields only marginal improvements for Poisson (MAE 1.76 → 1.764, essentially identical).
+
+    -   For the Negative Binomial, accuracy improves relative to its temporal-only version (RMSE 3.12 → 3.02), but still remains worse than the Poisson models overall.
+:::
+
+**Check for Overdispersion: Poisson Model**
+
+```{r}
+# ------------------------------------------------------------
+# 7) Overdispersion (Poisson only)
+# ------------------------------------------------------------
+disp_tbl <- tibble(
+  Model = c("Poisson (baseline)", "Poisson (+ temporal lags)", "Poisson (+ temporal + spatial lags)"),
+  Dispersion = c(
+    pois_disp(m_poi_base),
+    pois_disp(m_poi_temp),
+    pois_disp(m_poi_tsp)
+  )
+) %>%
+  mutate(Dispersion = round(Dispersion, 3))
+
+disp_tbl %>%
+  kable(align = c("l","r")) %>%
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover","condensed"))
+```
+
+::: callout-caution
+## Overdispersion for Poisson Models
+
+The value for all three models are well above 1 which indicates substantial overdispersion. This is largely expected because eviction filings vary widely across tracts and months, and adding temporal lags can somewhat reduce dispersion.
+:::
+
+### 4.2 \| Modeling using spatial cross-validation
+
+**Spatial CV Method:**
+
+-   Each census tract (GEOID) is randomly assigned to one of K = 10 folds.
+-   Every row for that tract across all months inherits the same fold label.
+-   This means that an entire tract’s time series is either in the training set or the test set for a given fold, preventing leakage where the model sees earlier months from a tract and then is “tested” on later months from the same tract.
+
+```{r}
+#| label: CV_Kfold_By_GEOID
+#| message: false
+#| warning: false
+
+set.seed(123)
+K <- 10
+
+# ----------------------------
+# 1) Assign folds at the GEOID level
+# ----------------------------
+geos <- sort(unique(df_model$GEOID))
+fold_map <- tibble(
+  GEOID = geos,
+  fold  = sample(rep(1:K, length.out = length(geos)))
+)
+
+df_cv <- df_model %>%
+  left_join(fold_map, by = "GEOID")
+
+# ----------------------------
+# 2) Formulas (reuse your variable sets)
+# ----------------------------
+x_base <- intersect(cand_x, names(df_cv))
+
+x_temp <- intersect(
+  c(x_base, "lag_1m", "lag_3m", "lag_6m", "lag_12m"),
+  names(df_cv)
+)
+
+x_tsp <- intersect(
+  c(x_temp, "slag_lag1m", "slag_lag3m", "slag_lag6m", "slag_lag12m"),
+  names(df_cv)
+)
+
+f_base <- as.formula(paste("evictions ~", paste(x_base, collapse = " + ")))
+f_temp <- as.formula(paste("evictions ~", paste(x_temp, collapse = " + ")))
+f_tsp  <- as.formula(paste("evictions ~", paste(x_tsp,  collapse = " + ")))
+
+mae  <- function(y, yhat) mean(abs(y - yhat), na.rm = TRUE)
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2, na.rm = TRUE))
+
+# ----------------------------
+# 3) Run CV
+# ----------------------------
+cv_out <- list()
+j <- 1
+
+for (k in 1:K) {
+
+  train <- df_cv %>% filter(fold != k) %>% select(-fold)
+  test  <- df_cv %>% filter(fold == k) %>% select(-fold)
+
+  # Fit (Poisson always; NegBin can sometimes fail -> tryCatch)
+  m_poi_base <- glm(f_base, data = train, family = poisson())
+  m_poi_temp <- glm(f_temp, data = train, family = poisson())
+  m_poi_tsp  <- glm(f_tsp,  data = train, family = poisson())
+
+  m_nb_base <- tryCatch(MASS::glm.nb(f_base, data = train), error = function(e) NULL)
+  m_nb_temp <- tryCatch(MASS::glm.nb(f_temp, data = train), error = function(e) NULL)
+  m_nb_tsp  <- tryCatch(MASS::glm.nb(f_tsp,  data = train), error = function(e) NULL)
+
+  # Predict helpers
+  pred_poi <- function(m) as.numeric(predict(m, newdata = test, type = "response"))
+  pred_nb  <- function(m) if (is.null(m)) NA_real_ else as.numeric(predict(m, newdata = test, type = "response"))
+
+  # Collect fold results
+  fold_tbl <- tibble(
+    fold = k,
+    Model = c(
+      "Poisson (baseline)",
+      "Poisson (+ temporal lags)",
+      "Poisson (+ temporal + spatial lags)",
+      "NegBin (baseline)",
+      "NegBin (+ temporal lags)",
+      "NegBin (+ temporal + spatial lags)"
+    ),
+    yhat = list(
+      pred_poi(m_poi_base),
+      pred_poi(m_poi_temp),
+      pred_poi(m_poi_tsp),
+      pred_nb(m_nb_base),
+      pred_nb(m_nb_temp),
+      pred_nb(m_nb_tsp)
+    )
+  ) %>%
+    mutate(
+      MAE  = map_dbl(yhat, ~ mae(test$evictions, .x)),
+      RMSE = map_dbl(yhat, ~ rmse(test$evictions, .x))
+    ) %>%
+    select(fold, Model, MAE, RMSE)
+
+  cv_out[[j]] <- fold_tbl
+  j <- j + 1
+}
+
+cv_tbl <- bind_rows(cv_out)
+
+# ----------------------------
+# 4) Summary kable (mean over folds)
+# ----------------------------
+cv_summary <- cv_tbl %>%
+  group_by(Model) %>%
+  summarise(
+    MAE_mean  = mean(MAE,  na.rm = TRUE),
+    RMSE_mean = mean(RMSE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    MAE_mean  = round(MAE_mean,  3),
+    RMSE_mean = round(RMSE_mean, 3)
+  )
+
+cv_summary %>%
+  kable(col.names = c("Model", "MAE (mean over folds)", "RMSE (mean over folds)"),
+        align = c("l","r","r")) %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"))
+```
+
+::: callout-note
+## Interpretation of CV Metrics
+
+**The best generalizing model is the Poisson with temporal + spatial lags, with the lowest MAE and a controlled** **RMSE.**
+
+-   Poisson models consistently outperform Negative Binomial models in spatial CV
+    -   Across all feature sets, Poisson models produce lower MAE and dramatically lower RMSE than their NegBin counterparts
+    -   The Negative Binomial model might be struggling under spatial CV because the dispersion parameter learned in one set of tracts does not transfer well to unseen tracts—leading to extreme residual errors
+-   Temporal Lags significantly improve Poisson model accuracy, and adding spatial lags produces a modest further improvement
+:::
+
+## 5.0 \| Spatial Diagnostics
+
+```{r}
+#| label: CV_Spatial_Errors_Best_Model
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 7
+
+# -------------------------------------------------------------------
+# 1) Collect OUT-OF-FOLD predictions for BEST model: Poisson (tsp)
+# -------------------------------------------------------------------
+pred_best_all <- vector("list", K)
+
+for (k in 1:K) {
+
+  train <- df_cv %>% filter(fold != k) %>% select(-fold)
+  test  <- df_cv %>% filter(fold == k) %>% select(-fold)
+
+  m_best <- glm(f_tsp, data = train, family = poisson())
+
+  test$pred_best <- as.numeric(predict(m_best, newdata = test, type = "response"))
+  test$abs_err   <- abs(test$evictions - test$pred_best)
+  test$fold      <- k
+
+  pred_best_all[[k]] <- test %>%
+    dplyr::select(GEOID, month_date, fold, evictions, pred_best, abs_err)
+}
+
+pred_best_df <- bind_rows(pred_best_all)
+
+# -------------------------------------------------------------------
+# 2) Collapse to a TRACT-LEVEL error surface (mean MAE over all OOF obs)
+# -------------------------------------------------------------------
+tract_errors_best <- pred_best_df %>%
+  group_by(GEOID) %>%
+  summarise(
+    MAE  = mean(abs_err, na.rm = TRUE),
+    RMSE = sqrt(mean((evictions - pred_best)^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# quick kable sanity check (top error tracts)
+tract_errors_best %>%
+  arrange(desc(MAE)) %>%
+  slice_head(n = 10) %>%
+  mutate(across(c(MAE, RMSE), ~ round(.x, 3))) %>%
+  kable(col.names = c("GEOID", "MAE", "RMSE"),
+        caption   = "Census Tracts with Highest Prediction Errors",
+        align = c("l","r","r")) %>%
+  kable_styling(full_width = FALSE,
+                bootstrap_options = c("striped","hover","condensed"))
+```
+
+```{r}
+# -------------------------------------------------------------------
+# 3) Join to geometry and map
+# -------------------------------------------------------------------
+map_errors_best <- tract_joined %>%
+  dplyr::select(GEOID, geometry) %>%
+  left_join(tract_errors_best, by = "GEOID")
+
+ggplot(map_errors_best) +
+  geom_sf(aes(fill = MAE), color = NA) +
+  scale_fill_viridis_c(name = "MAE (evictions)", na.value = "grey90") +
+  labs(
+    title = "Spatial Distribution of Out-of-Fold Errors (Best Model)",
+    subtitle = "Poisson (+ temporal + spatial lags); k-fold CV; MAE by tract"
+  ) +
+  mapTheme
+```
+
+::: callout-note
+## Spatial Distribution of Out-of-Fold (OOF) Errors
+
+-   Poisson model with temporal + spatial lags generally achieves low prediction error across most Philadelphia census tracts, with MAE values typically in the range of 1–5 evictions
+-   A small number of tracts, particularly several in Northeast Philadelphia and a few isolated tracts in the northwest and southwest, exhibit much higher errors (MAE \> 10). These outlier tracts likely reflect idiosyncratic eviction patterns, atypical local conditions, or sudden temporal changes that are not well captured by past eviction history or neighboring trends.
+-   Their isolation (not part of large clusters) reinforces that the model struggles most in tracts with unusual or highly variable eviction behavior rather than in neighborhoods with consistent patterns.
+:::
+
+------------------------------------------------------------------------
+
+## Limitations and Areas for Future Research
+
+-   Over the course of the pandemic, there were **various national, state, and city-level eviction moratoriums and eviction diversion programs**. As our main eviction filing count dataset from The Eviction Lab covers the years 2020-2025, a substantial portion of our training dataset will exhibit substantial variation because of these eviction moratoriums and diversion programs. As a result, our predictive model may be constrained in its accuracy because of the underlying structural variation in the training dataset.
+
+-   Our analysis and model takes place at the Census Tracts level because we only have access to eviction filing count data by tract. However, future research and implementation should consider **different units of analysis such as Block Groups or Zip Codes**. While Zip Codes are arbitrary geographical boundaries set by the USPS, some eviction-related policies are determined at the Zip Code rather than the Census Tract level. For example, Philadelphia's Right to Counsel (RTC) program provides free legal representation to low-income tenants facing eviction in the eight zip codes with among the highest levels of eviction volume.
+
+-   It is critical to obtain **record-level eviction court data** to make more detailed analysis and predictions on tenant and landlord characteristics.
+
+-   Beyond eviction filing counts, it is also important to analyze **eviction outcomes** and the factors that influence these outcomes. For example, the Pew Research Center found that eviction court outcomes in Philadelphia show statistically significant differentation based on the type of landlord (individual vs corporate vs government/housing authority landlords). Another area of recent research has been the transit accessibility and how longer travel times to the courthouse increase the probability of default (Hoffman & Strezhnev, 2022).

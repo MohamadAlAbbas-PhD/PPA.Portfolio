@@ -1,0 +1,1198 @@
+---
+title: "Spatial Predictive Analysis"
+subtitle: "Modeling Vacant and Abandoned Property Risk in Chicago"
+author: "Mohamad AlAbbas"
+date: today
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+::: {.callout-note appearance="minimal"}
+**Course:** MUSA 5080 — Geospatial Machine Learning for Urban Planning, University of Pennsylvania
+**Portfolio:** [mohamadalabbas-phd.github.io](https://mohamadalabbas-phd.github.io)
+**Summary:** Builds a spatial predictive model for vacant and abandoned property risk in Chicago using fishnet grid aggregation, k-nearest neighbor features, Local Moran's I hotspot detection, and contextual socioeconomic covariates.
+:::
+
+## Setup
+
+```{r}
+#| label: Library-Setup
+#| message: false
+#| warning: false
+#| results: hide
+
+# Load required packages
+library(tidyverse)
+library(sf)
+library(here)
+library(viridis)
+library(terra)
+library(spdep)
+library(FNN)
+library(MASS)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(classInt)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(scales)
+library(ggfx)
+library(units)
+library(tidycensus)
+library(tidyverse)
+library(spatstat)
+library(spatstat.geom)
+library(spatstat.explore)
+library(raster)
+
+# Set options
+options(scipen = 999)  # No scientific notation
+set.seed(5080)         # Reproducibility
+
+# ── Visual Themes ─────────────────────────────────────────────────────────────
+plotTheme <- theme(
+  plot.title       = element_text(size = 14, face = "bold"),
+  plot.subtitle    = element_text(size = 11, color = "grey40"),
+  plot.caption     = element_text(size = 8,  color = "grey55", hjust = 1),
+  axis.text        = element_text(size = 9),
+  axis.title       = element_text(size = 10, face = "bold"),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "#fafafa", color = NA),
+  plot.background  = element_rect(fill = "white",   color = NA),
+  legend.title     = element_text(size = 9,  face = "bold"),
+  legend.text      = element_text(size = 8)
+)
+
+mapTheme <- theme_void() +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold"),
+    plot.subtitle   = element_text(size = 11, color = "grey40"),
+    plot.caption    = element_text(size = 8,  color = "grey55", hjust = 1),
+    legend.title    = element_text(size = 9,  face = "bold"),
+    legend.text     = element_text(size = 8),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+palette5 <- c("#f0f9e8", "#bae4bc", "#7bccc4", "#43a2ca", "#0868ac")
+```
+
+# 311 Violation Type - Abandoned/Vacant Houses
+
+The violation type I analyze is vacant/abandoned houses. Unlike abandoned cars, which can be towed and moved, vacant houses are fixed and often persist for years. That persistence implies two things: (1) counts and hotspots of vacancy are likely stable over a one-year window, and (2) vacancy may be strongly associated with burglary risk, because prolonged emptiness weakens guardianship and natural surveillance around the property.
+
+For modeling, this slow-moving signal should yield high spatial and temporal autocorrelation, making vacancy a strong predictor of year-to-year burglary variation at the grid-cell level. Still, correlation isn’t causation: shared structural conditions (poverty, tenure, disinvestment) can drive both vacancy and burglary. We address this with controls (income, renter share, poverty, age composition), but some confounding may remain. Finally, 311 reports likely undercount vacancy in high-need areas, so we treat them as a conservative proxy. Given the stability of vacancy, we expect spatial cross-validation to look stronger than pure out-of-time (2018) validation—precisely what our LOGO vs. temporal checks assess.
+
+## Load Data & Boundaries
+
+This chunk loads and prepares all spatial inputs for the analysis: it reads the vacant and abandoned houses CSV, parses the service request date, filters records with valid coordinates from 2017, converts them to an sf point layer in WGS84 and reprojects to ESRI:102271; it reads the burglaries shapefile and reprojects to the same CRS; it downloads police districts and police beats from the Chicago open data portal, reprojects them, and keeps their key ID fields; it loads the Chicago city boundary from GitHub and reprojects it.
+
+```{r}
+#| label: Load Boundaries & Data
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+# Load abandoned houses
+abandoned_houses <- read_csv(here::here("data/Vacant_and_Abandoned_Buildings.csv"), show_col_types = FALSE) %>%
+  mutate(date_received = mdy(`DATE SERVICE REQUEST WAS RECEIVED`)) %>%
+  filter(!is.na(Latitude), !is.na(Longitude), year(date_received) == 2017) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>%
+  st_transform('ESRI:102271')
+
+# Load from provided data file (downloaded from Chicago open data portal)
+burglaries <- st_read(here("data", "burglaries.shp")) %>% 
+  st_transform('ESRI:102271')
+
+# Load police districts (used for spatial cross-validation)
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/24zt-jpfn?method=export&format=GeoJSON",
+          quiet = TRUE) %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+
+# Load police beats (smaller administrative units)
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/n9it-hstw?method=export&format=GeoJSON",
+          quiet = TRUE) %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(Beat = beat_num)
+
+# Load Chicago boundary
+chicagoBoundary <- 
+  st_read("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/Chapter5/chicagoBoundary.geojson",
+          quiet = TRUE) %>%
+  st_transform('ESRI:102271')
+
+```
+
+## Visual Distribution of Vacant and Abandoned Houses
+
+This chunk creates two complementary maps to explore vacant and abandoned house locations in 2017: a point map that plots every record on top of the Chicago boundary, and a filled kernel density surface that highlights areas with higher concentrations of points; both layers use the same CRS and styling for consistency, then the two plots are combined side by side with a shared annotation. Note that the combined plot title currently says “Spatial Distribution of Burglaries in Chicago,” which does not match the data being mapped; change it to “Spatial Distribution of Vacant and Abandoned Houses in Chicago” if you want the caption to reflect the content.
+
+```{r}
+#| label: Visualize Points
+#| fig-height: 6
+#| fig-width: 8
+
+# Simple point map
+p1 <- ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "gray95", color = "gray60") +
+  geom_sf(data = abandoned_houses, color = "maroon", size = 0.2, alpha = 0.4) +
+  labs(
+    title = "Abandoned Houses Locations",
+    subtitle = paste0("Chicago 2017, n = ", nrow(abandoned_houses))
+  )
+
+# Density surface using modern syntax
+p2 <- ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "gray95", color = "gray60") +
+  geom_density_2d_filled(
+    data = data.frame(st_coordinates(abandoned_houses)),
+    aes(X, Y),
+    alpha = 0.7,
+    bins = 8
+  ) +
+  scale_fill_viridis_d(
+    option = "plasma",
+    direction = -1,
+    guide = "none"  # Modern ggplot2 syntax (not guide = FALSE)
+  ) +
+  labs(
+    title = "Density Surface",
+    subtitle = "Kernel density estimation"
+  )
+
+# Combine plots using patchwork (modern approach)
+p1 + p2 + 
+  plot_annotation(
+    title = "Spatial Distribution of Burglaries in Chicago",
+    tag_levels = 'A'
+  )
+
+```
+
+From the maps above, we note that most reports are concentrated on the South Side, forming a broad high-intensity corridor from the south-central area toward the southeast; a smaller secondary cluster appears on the southwest side. The North and far Northwest sides show relatively few points, and the near-north lakefront is especially sparse. Overall, the pattern is distinctly uneven across the city, with clear hot spots in the south and southeast and cooler areas in the north and northwest, consistent with strong spatial clustering rather than a uniform distribution.
+
+# Fishnet Grid and Vacancy Distribution
+
+This section constructs a regular analysis grid for Chicago, aggregates both vacant or abandoned house reports and burglary incidents to that grid, and then maps the resulting counts so we can inspect how vacancy is distributed across space before modeling.
+
+## Fishnet Creation
+
+The code builds a citywide grid of 500 by 500 meter cells, assigns each cell a unique identifier, clips the grid to the Chicago boundary so only in-city cells remain, and prints a small summary table with the number of cells, the fixed cell size, and the area of a representative cell; this verifies that the grid is correctly sized and spatially aligned before any event aggregation.
+
+```{r}
+#| label: Create Fishnet
+
+# Create 500m x 500m grid
+fishnet <- st_make_grid(
+  chicagoBoundary,
+  cellsize = 500,  # 500 meters per cell
+  square = TRUE
+) %>%
+  st_sf() %>%
+  mutate(uniqueID = row_number())
+
+# Keep only cells that intersect Chicago
+fishnet <- fishnet[chicagoBoundary, ]
+
+# View basic info
+info_tbl <- tibble::tibble(
+  Metric = c("Number of cells", "Cell size", "Cell area (m²)"),
+  Value  = c(
+    scales::comma(nrow(fishnet)),
+    "500 × 500 m",
+    scales::comma(round(as.numeric(units::drop_units(sf::st_area(fishnet[1, ])))))
+  )
+)
+
+knitr::kable(
+  info_tbl,
+  caption   = "Fishnet Summary",
+  col.names = c("Metric", "Value"),
+  align     = c("l","r"),
+  booktabs  = TRUE
+) |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("striped","hover","condensed")) |>
+  kableExtra::column_spec(1, bold = TRUE)
+```
+
+## Aggregate Violations Per Grid Cell
+
+The code spatially joins burglary points and vacant or abandoned house points to the grid cells that contain them, computes per-cell counts for each dataset, and attaches those counts back to the grid; cells with no points are set to zero so the counts are usable in models and maps, and a brief summary of the vacancy counts is printed to confirm the distribution after aggregation.
+
+```{r}
+#| label: Aggregate Abandoned/Vacant Houses
+
+# Spatial join: which cell contains each burglary?
+# Aggregate BURGLARIES to the 500m grid
+burg_fishnet <- st_join(burglaries, fishnet, join = st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID) %>%
+  summarize(burglaries = n(), .groups = "drop")
+
+# Spatial join: which cell contains each abandoned/vacant house?
+# Aggregate abandoned/vacant house to the 500m grid
+
+houses_fishnet <- st_join(abandoned_houses, fishnet, join = st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID) %>%
+  summarize(abandoned_houses = n())
+
+# Join back to fishnet (cells with 0 burglaries will be NA)
+fishnet <- fishnet %>%
+  left_join(burg_fishnet, by = "uniqueID") %>%
+  mutate(burglaries = tidyr::replace_na(burglaries, 0))
+
+# Join back to fishnet (cells with 0 abandoned/vacant house will be NA)
+fishnet <- fishnet %>%
+  left_join(houses_fishnet, by = "uniqueID") %>%
+  mutate(abandoned_houses = replace_na(abandoned_houses, 0))
+
+# Basic summary stats
+abandoned_summary <- summary(fishnet$abandoned_houses)
+
+# Zero-count cells
+zero_count <- sum(fishnet$abandoned_houses == 0)
+zero_pct   <- 100 * zero_count / nrow(fishnet)
+
+# Order of numeric stats as in summary()
+stat_names <- c("Min.", "1st Qu.", "Median", "Mean", "3rd Qu.", "Max.")
+
+# Extract, round, and format to 2 decimal places
+numeric_vals <- abandoned_summary[stat_names]
+numeric_vals <- as.numeric(numeric_vals)
+numeric_vals <- round(numeric_vals, 2)
+numeric_vals <- sprintf("%.2f", numeric_vals)
+
+summary_tbl <- tibble::tibble(
+  Statistic = c(
+    "Min",
+    "1st Quartile",
+    "Median",
+    "Mean",
+    "3rd Quartile",
+    "Max",
+    "Cells with zero abandoned houses"
+  ),
+  Value = c(
+    numeric_vals,
+    paste0(
+      scales::comma(zero_count), " / ", 
+      scales::comma(nrow(fishnet)), 
+      " (", round(zero_pct, 1), "%)"
+    )
+  )
+)
+
+knitr::kable(
+  summary_tbl,
+  caption   = "Summary of Vacant/Abandoned House Counts per Grid Cell",
+  col.names = c("Statistic", "Value"),
+  align     = c("l","r"),
+  booktabs  = TRUE
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped","hover","condensed")
+  )
+```
+
+## Visuals of Count Distribution
+
+The code draws a choropleth of the grid where each cell is filled by its count of vacant or abandoned houses, overlays the city boundary for context, and applies a square-root color transformation with sensible breaks to make skewed count data easier to read; the map title and subtitle document the metric and the 2017 study window.
+
+```{r}
+#| label: Visualize Fishnet
+#| fig-width: 8
+#| fig-height: 6
+
+# Visualize aggregated counts
+ggplot() +
+  geom_sf(data = fishnet, aes(fill = abandoned_houses), color = NA) +
+  geom_sf(data = chicagoBoundary, fill = NA, color = "white", linewidth = 1) +
+  scale_fill_viridis_c(
+    name = "Abandoned Houses",
+    option = "plasma",
+    trans = "sqrt",  # Square root for better visualization of skewed data
+    breaks = c(0, 1, 5, 10, 20, 40)
+  ) +
+  labs(
+    title = "Vacant/Abandoned House Counts by Grid Cell",
+    subtitle = "500m x 500m cells, Chicago 2017"
+  ) +
+  plotTheme
+```
+
+The choropleth confirms the earlier point-pattern story but makes the structure crisper at the 500 m grid scale. High vacancy counts cluster in a south-central to southeast corridor with a companion cluster on the southwest side, while the North and far Northwest remain predominantly zero or near-zero. Aggregation reduces noise from isolated points and reveals contiguous bands of elevated vacancy rather than scattered dots, including a clear ridge running south of the Loop into the Far South Side and pockets along the southeast lakefront. The square-root color scale shows many low-count cells surrounding the cores, suggesting steep local gradients at hot-spot edges. In short, vacancy is highly clustered and spatially persistent, with hot spots concentrated in the South and Southeast and widespread low counts in the North and Northwest, consistent with the earlier KDE and point maps but now expressed as area-based intensity.
+
+# Spatial Features
+
+This section engineers spatial predictors from the vacancy surface and adds contextual controls. It measures proximity to vacant structures, detects statistically significant clusters, converts those clusters into a distance-to-hotspot feature, and enriches the grid with police districts and ACS demographics for use in modeling burglary counts.
+
+## Calculate K-Nearest Neighbor Features
+
+The code takes centroids of the grid cells and the coordinates of vacant or abandoned houses, computes the nearest neighbor distance for each cell (k = 1), and writes that value to abandoned_houses.nn. The resulting feature captures how close each cell is to the nearest vacancy concentration.
+
+```{r}
+#| label: NN Abandoned
+#| message: false
+
+# Get coordinates
+fishnet_coords <- st_coordinates(st_centroid(fishnet))
+abandoned_coords <- st_coordinates(abandoned_houses)
+
+# Calculate k nearest neighbors and distances
+nn_result <- get.knnx(abandoned_coords, fishnet_coords, k = 3)
+
+# Add to fishnet
+fishnet <- fishnet %>%
+  mutate(
+    abandoned_houses.nn = rowMeans(nn_result$nn.dist)
+  )
+
+# Summary of mean distance to 3 nearest abandoned houses
+nn_summary <- summary(fishnet$abandoned_houses.nn)
+
+# Order of numeric stats as in summary()
+stat_names <- c("Min.", "1st Qu.", "Median", "Mean", "3rd Qu.", "Max.")
+
+# Extract, round, and format to 2 decimal places
+nn_vals <- nn_summary[stat_names]
+nn_vals <- as.numeric(nn_vals)
+nn_vals <- round(nn_vals, 2)
+nn_vals <- sprintf("%.2f", nn_vals)
+
+nn_tbl <- tibble::tibble(
+  Statistic = c("Min", "1st Quartile", "Median", "Mean", "3rd Quartile", "Max"),
+  `Distance (m)` = nn_vals
+)
+
+knitr::kable(
+  nn_tbl,
+  caption   = "Summary of Mean Distance to 3 Nearest Vacant/Abandoned Houses (meters)",
+  col.names = c("Statistic", "Distance (m)"),
+  align     = c("l","r"),
+  booktabs  = TRUE
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped","hover","condensed")
+  )
+```
+
+## Perform Local Moran's I analysis
+
+The code creates a k-nearest neighbor weights matrix on grid centroids (k = 5), runs Local Moran’s I on the abandoned_houses counts, and generates a categorical label (High-High, Low-Low, High-Low, Low-High, or Not Significant). This identifies locations where there are hotspots, coldspots, or outliers. This is useful in substantivbe interpretations to discover whether vacnact or abandoned households are in-step or spatially clustered with neighboring households. It actually supports our initial theory that house abandonment (foreclosure) is likely to occur in generally similar neighborhoods.
+
+```{r}
+#| label: LISA Generation
+
+# Function to calculate Local Moran's I
+calculate_local_morans <- function(data, variable, k = 5) {
+  
+  # Create spatial weights
+  coords <- st_coordinates(st_centroid(data))
+  neighbors <- knn2nb(knearneigh(coords, k = k))
+  weights <- nb2listw(neighbors, style = "W", zero.policy = TRUE)
+  
+  # Calculate Local Moran's I
+  local_moran <- localmoran(data[[variable]], weights)
+  
+  # Classify clusters
+  mean_val <- mean(data[[variable]], na.rm = TRUE)
+  
+  data %>%
+    mutate(
+      local_i = local_moran[, 1],
+      p_value = local_moran[, 5],
+      is_significant = p_value < 0.05,
+      
+      moran_class = case_when(
+        !is_significant ~ "Not Significant",
+        local_i > 0 & .data[[variable]] > mean_val ~ "High-High",
+        local_i > 0 & .data[[variable]] <= mean_val ~ "Low-Low",
+        local_i < 0 & .data[[variable]] > mean_val ~ "High-Low",
+        local_i < 0 & .data[[variable]] <= mean_val ~ "Low-High",
+        TRUE ~ "Not Significant"
+      )
+    )
+}
+
+# Apply to abandoned Houses
+fishnet <- calculate_local_morans(fishnet, "abandoned_houses", k = 5)
+```
+
+## Identify Hot Spots and Cold Spots
+
+The code draws a choropleth of the moran_class categories to show where significant high clusters (Hot/Cold spots) and low clusters of vacancy occur across the city. The legend clarifies class meanings so the map can be used to visually verify cluster structure before modeling.
+
+```{r}
+#| label: Visualize LISA
+#| fig-width: 8
+#| fig-height: 6
+
+# Visualize hot spots
+ggplot() +
+  geom_sf(
+    data = fishnet, 
+    aes(fill = moran_class), 
+    color = NA
+  ) +
+  scale_fill_manual(
+    values = c(
+      "High-High" = "#d7191c",
+      "High-Low" = "#fdae61",
+      "Low-High" = "#abd9e9",
+      "Low-Low" = "#2c7bb6",
+      "Not Significant" = "gray90"
+    ),
+    name = "Cluster Type"
+  ) +
+  labs(
+    title = "Local Moran's I: Abandoned House Clusters",
+    subtitle = "High-High = Hot spots of disorder"
+  ) +
+  plotTheme
+```
+
+The LISA map shows vacancy hot spots concentrated on the South and Southeast sides, with additional pockets on the Southwest and a few small clusters on the West Side. Most cells are “Not Significant,” which means their vacancy levels are either average or lack strong similarity with neighbors at the k = 5 neighborhood scale. The few “Low-High” cells appear along the fringes of hot areas and indicate local dips embedded within otherwise high-vacancy neighborhoods, consistent with edge effects at cluster boundaries. Overall, the pattern reinforces our earlier findings: vacancy is highly clustered rather than uniform, with multi-cell cores in the south that are likely to be influential in burglary risk modeling and useful for distance-to-hotspot features.
+
+## Create Distance-to-Hotspot Measures
+
+The code extracts centroids of cells labeled High-High, unions them into a single geometry, and computes the distance from each grid centroid to the nearest hotspot. The resulting dist_to_hotspot feature captures how far a location is from the nearest vacancy hot area and defaults to zero when no significant hotspots are found.
+
+```{r}
+#| label: distance to hotspots
+
+# Get centroids of "High-High" cells (hot spots)
+hotspots <- fishnet %>%
+  filter(moran_class == "High-High") %>%
+  st_centroid()
+
+# Calculate distance from each cell to nearest hot spot
+if (nrow(hotspots) > 0) {
+  fishnet <- fishnet %>%
+    mutate(
+      dist_to_hotspot = as.numeric(
+        st_distance(st_centroid(fishnet), hotspots %>% st_union())
+      )
+    )
+}
+```
+
+## Join Additional Contextual Data
+
+The code assigns each grid cell to a police district, then downloads 2017 ACS tract data for Cook County, computes demographic and socioeconomic percentages and median income, and joins these attributes to the grid where cells intersect tracts. These controls (race or ethnicity shares, poverty, renter share, vacancy, age structure, and income) provide broader structural context for explaining burglary patterns beyond vacancy alone.
+
+```{r join-districts}
+#| message: false
+#| results: 'hide'
+
+# Join district information to fishnet
+fishnet <- st_join(
+  fishnet,
+  policeDistricts,
+  join = st_within,
+  left = TRUE
+) %>%
+  filter(!is.na(District))  # Remove cells outside districts
+
+cat("✓ Joined police districts\n")
+cat("  - Districts:", length(unique(fishnet$District)), "\n")
+cat("  - Cells:", nrow(fishnet), "\n")
+
+
+acs_year <- 2017
+
+# One variable set: race/eth, poverty, tenure, vacancy, income, total pop, and age bins
+acs_vars <- c(
+  # Totals / Income
+  tot_pop = "B03002_001",
+  med_inc = "B19013_001",
+
+  # Race / Ethnicity (not Hispanic for white/black; Hispanic any race)
+  white   = "B03002_003",
+  black   = "B03002_004",
+  hisp    = "B03002_012",
+
+  # Poverty
+  pov_tot = "B17001_001",
+  pov_num = "B17001_002",
+
+  # Tenure & vacancy
+  occ_tot = "B25003_001",
+  renters = "B25003_003",
+  vac_tot = "B25002_001",
+  vac_cnt = "B25002_003",
+
+  # --- Age bins from B01001
+  # Male 45–64
+  m45_49 = "B01001_015",
+  m50_54 = "B01001_016",
+  m55_59 = "B01001_017",
+  m60_61 = "B01001_018",
+  m62_64 = "B01001_019",
+  # Male 65+
+  m65_66 = "B01001_020",
+  m67_69 = "B01001_021",
+  m70_74 = "B01001_022",
+  m75_79 = "B01001_023",
+  m80_84 = "B01001_024",
+  m85p   = "B01001_025",
+  # Female 45–64
+  f45_49 = "B01001_039",
+  f50_54 = "B01001_040",
+  f55_59 = "B01001_041",
+  f60_61 = "B01001_042",
+  f62_64 = "B01001_043",
+  # Female 65+
+  f65_66 = "B01001_044",
+  f67_69 = "B01001_045",
+  f70_74 = "B01001_046",
+  f75_79 = "B01001_047",
+  f80_84 = "B01001_048",
+  f85p   = "B01001_049"
+)
+
+# Pull Cook County tracts with geometry
+tracts_all <- get_acs(
+  geography = "tract",
+  state = "IL",
+  county = "Cook",
+  year = acs_year,
+  variables = acs_vars,
+  survey = "acs5",
+  output = "wide",
+  geometry = TRUE
+)
+
+# Keep tracts intersecting Chicago boundary; compute metrics
+tracts_chi <- tracts_all %>%
+  st_transform(st_crs(chicagoBoundary)) %>%
+  st_filter(chicagoBoundary, .predicate = st_intersects) %>%
+  dplyr::mutate(
+    # Age totals
+    pop45_64 = (m45_49E + m50_54E + m55_59E + m60_61E + m62_64E +
+                f45_49E + f50_54E + f55_59E + f60_61E + f62_64E),
+    pop65p   = (m65_66E + m67_69E + m70_74E + m75_79E + m80_84E + m85pE +
+                f65_66E + f67_69E + f70_74E + f75_79E + f80_84E + f85pE),
+
+    # Percentages
+    pct_white   = 100 * whiteE / pmax(tot_popE, 1),
+    pct_black   = 100 * blackE / pmax(tot_popE, 1),
+    pct_hisp    = 100 * hispE  / pmax(tot_popE, 1),
+    pct_poverty = 100 * pov_numE / pmax(pov_totE, 1),
+    pct_renter  = 100 * rentersE / pmax(occ_totE, 1),
+    pct_vacant  = 100 * vac_cntE / pmax(vac_totE, 1),
+    pct_45_64   = 100 * pop45_64 / pmax(tot_popE, 1),
+    pct_65_plus = 100 * pop65p   / pmax(tot_popE, 1),
+
+    med_income  = med_incE
+  ) %>%
+  dplyr::select(GEOID, pct_white, pct_black, pct_hisp,
+                pct_poverty, pct_renter, pct_vacant,
+                med_income, pct_45_64, pct_65_plus)
+
+# Join tract attributes to fishnet (centroid/any-intersection)
+fishnet <- fishnet %>%
+  st_join(tracts_chi, join = st_intersects, left = TRUE)
+
+# (optional) peek
+knitr::kable(
+  fishnet %>%
+    sf::st_drop_geometry() %>%
+    dplyr::select(
+      abandoned_houses, pct_black, pct_hisp, pct_white,
+      pct_poverty, pct_renter, pct_vacant, med_income,
+      pct_45_64, pct_65_plus
+    ) %>%
+    dplyr::slice(1:6),
+  caption = "Sample of ACS features joined to fishnet",
+  booktabs = TRUE
+) %>%
+  kableExtra::kable_styling(full_width = FALSE,
+                            bootstrap_options = c("condensed","striped"))
+
+```
+
+# Count Regression Models
+
+This section prepares the modeling frame, fits a Poisson and a Negative Binomial count model for burglaries using vacancy features and ACS controls, checks for overdispersion, and selects the preferred specification based on AIC for downstream prediction and validation.
+
+## Fit Poisson Regression
+
+The code builds fishnet_model by dropping geometry, selecting the outcome burglaries, adding vacancy predictors (abandoned_houses, nearest vacancy distance, distance to vacancy hotspots), and including demographic and socioeconomic controls. Percentage variables are rescaled to proportions and median income is log transformed to reduce skew. A Poisson GLM with log link is then estimated, and a summary is printed to inspect coefficients and standard errors.
+
+```{r}
+
+fishnet_model <- fishnet %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(
+    uniqueID,
+    District,
+    burglaries,
+    abandoned_houses,# <-- DV (NEW)
+    abandoned_houses.nn,      # keep as a predictor
+    dist_to_hotspot,          # keep as a predictor
+    pct_black, pct_hisp,
+    pct_poverty, pct_renter,
+    med_income,
+    pct_45_64, pct_65_plus
+  ) %>%
+  dplyr::mutate(
+    across(c(pct_black, pct_hisp, pct_poverty, pct_renter, pct_45_64, pct_65_plus), ~ .x / 100),
+    log_income = log(pmax(med_income, 1))
+  ) %>%
+  tidyr::drop_na()
+model_poisson <- glm(
+  burglaries ~ abandoned_houses + abandoned_houses.nn + dist_to_hotspot +
+    pct_black + pct_hisp + pct_poverty + pct_renter +
+    log_income + pct_45_64 + pct_65_plus,
+  data   = fishnet_model,
+  family = poisson(link = "log")
+)
+
+print(summary(model_poisson))
+
+```
+
+Burglary counts increase with more vacant houses in a cell and with closer proximity to vacancy. Each additional vacant house is associated with about 4.5% higher expected burglaries (IRR ≈ exp(0.0439) = 1.045). Greater distance to the nearest vacant house lowers risk: a 100 m increase corresponds to ≈ 6.7% lower expected burglaries (IRR ≈ exp(−0.0006906×100) = 0.933). Being farther from vacancy hotspots also reduces risk slightly: 1 km farther gives ≈ 2.7% lower rates (IRR ≈ exp(−0.0000279×1000) = 0.973). Neighborhood structure matters: higher renter share is strongly positive (a 10 percentage-point increase → IRR ≈ exp(0.1×1.640) = 1.18, or +18%), higher log income is positive (IRR ≈ exp(0.394) = 1.48 per one-log increase), and percent Black is positive (10 percentage-points → \~2% higher, IRR ≈ 1.02). Percent Hispanic and ages 45–64 are not significant. Percent in poverty is negative and significant (10 percentage-points → \~10% lower, IRR ≈ exp(−0.1056) = 0.90), likely reflecting overlap with renter share and income. Percent 65+ is negative and significant (10 percentage-points → \~13% lower, IRR ≈ exp(−0.1473) = 0.86).
+
+## Fit Negative Binomial regression
+
+Because Poisson assumes equality of the mean and variance, the code computes a dispersion statistic from the Poisson residuals to diagnose overdispersion. If the statistic is meaningfully above 1.5 the variance exceeds the mean and a Negative Binomial model is more suitable. The same formula is then estimated with glm.nb, which adds a variance parameter to accommodate overdispersion, and its summary is printed.
+
+```{r}
+#| label: dispersion-check
+#| message: false
+#| warning: false
+
+# Calculate dispersion parameter
+dispersion <- sum(residuals(model_poisson, type = "pearson")^2) / 
+              model_poisson$df.residual
+
+# Build message lines
+disp_lines <- c(
+  paste0("Dispersion parameter: ", round(dispersion, 2)),
+  "Rule of thumb: >1.5 suggests overdispersion",
+  if (dispersion > 1.5) {
+    "⚠ Overdispersion detected! Consider Negative Binomial model."
+  } else {
+    "✓ Dispersion looks okay for Poisson model."
+  }
+)
+
+# Print as a single block
+cat(paste(disp_lines, collapse = "\n"))
+```
+
+```{r}
+model_nb <- MASS::glm.nb( burglaries ~ abandoned_houses +
+                            abandoned_houses.nn +
+                            dist_to_hotspot +
+                            pct_black + pct_hisp +
+                            pct_poverty + pct_renter +
+                            log_income +
+                            pct_45_64 + pct_65_plus,
+                          data = fishnet_model
+                          )
+summary(model_nb)
+
+```
+
+Overdispersion was substantial (dispersion ≈ 2.79), so moving to a Negative Binomial was appropriate; it fits much better (AIC 19,659; residual deviance 4,837 on 4,193 df) and estimates an overdispersion parameter θ ≈ 2.21. Vacancy intensity and proximity both raise burglary risk; tenure structure (more renters) is a strong correlate; older population share is associated with lower risk. The Negative Binomial specification handles variance better than Poisson and is the recommended model for inference and prediction.
+
+## Compare Model Fit (AIC)
+
+The code compares Poisson and Negative Binomial models using AIC, where lower values indicate a better balance of fit and parsimony. It assigns chosen_model to the model with the smaller AIC, records the winning name, computes the AIC difference, and prints a short recommendation that will guide which model to use for prediction, cross-validation, and temporal tests.
+
+```{r}
+#| label: aic-comparison
+#| message: false
+#| warning: false
+
+aic_poisson <- AIC(model_poisson)
+aic_nb      <- AIC(model_nb)
+
+if (aic_nb < aic_poisson) {
+  chosen_model <- model_nb
+  chosen_name  <- "Negative Binomial"
+  delta        <- aic_poisson - aic_nb
+} else {
+  chosen_model <- model_poisson
+  chosen_name  <- "Poisson"
+  delta        <- aic_nb - aic_poisson
+}
+
+# Build lines of text
+output_lines <- c(
+  "Model Comparison (lower AIC is better):",
+  paste0(" Poisson AIC: ", round(aic_poisson, 1)),
+  paste0(" Negative Binomial AIC: ", round(aic_nb, 1)),
+  "",
+  "Recommendation:",
+  paste0(" \u2192 Use the ", chosen_name,
+         " model (\u0394 AIC = ", round(delta, 1),
+         " vs. the alternative).")
+)
+
+# Print as a single block in the document
+cat(paste(output_lines, collapse = "\n"))
+
+```
+
+The Negative Binomial model clearly dominates: its AIC is 19,659 versus 22,448 for Poisson, a ΔAIC of about 2,789. Differences greater than 10 already constitute essentially decisive evidence, so this gap is overwhelming. Practically, it means the NB achieves a much better fit while accounting for model complexity, which aligns with the strong overdispersion you diagnosed. You should use the Negative Binomial for inference, LOGO cross-validation, and 2018 temporal validation, and treat the Poisson results as a misspecified baseline.
+
+# Spatial Cross-Validation (2017)
+
+This section evaluates out-of-sample performance with Leave-One-Group-Out cross-validation where each police district is held out in turn. For every fold, the Negative Binomial model is trained on all other districts and then used to predict burglary counts in the held-out district. We then summarize prediction errors to assess how well the model generalizes across space.
+
+## Implement Leave-One-Group-Out cross-validation on 2017 data
+
+The first block loops over districts, splits the data into train and test by district, fits the same NB formula on the training cells, and generates out-of-fold predictions for the held-out district. All predictions are stacked into cv_preds. The second block aggregates these predictions to MAE and RMSE per district, computes overall means (nb_mean_mae, nb_mean_rmse), prints a concise summary, and renders a per-district table for inspection.
+
+```{r}
+#| label: logo-cv-negbin-model
+#| message: false
+#| warning: false
+#| results: 'hide'
+# ---- LOGO Cross-Validation (NegBin only; DV = burglaries) ----
+
+districts <- unique(fishnet_model$District)
+cv_preds  <- tibble::tibble()
+
+for (i in seq_along(districts)) {
+  test_district <- districts[i]
+
+  # Split data
+  train_data <- dplyr::filter(fishnet_model, District != test_district)
+  test_data  <- dplyr::filter(fishnet_model, District == test_district)
+
+  # Fit Negative Binomial on training fold
+  m_nb <- MASS::glm.nb(
+    burglaries ~
+      abandoned_houses +        # predictor (keep)
+      abandoned_houses.nn +     # predictor (keep)
+      dist_to_hotspot +         # predictor (keep)
+      pct_black + pct_hisp +
+      pct_poverty + pct_renter +
+      log_income +
+      pct_45_64 + pct_65_plus,
+    data = train_data
+  )
+
+  # Predict on held-out district
+  preds <- test_data %>%
+    dplyr::transmute(
+      fold          = i,
+      test_district = test_district,
+      uniqueID,
+      y             = burglaries,
+      pred_negbin   = stats::predict(m_nb, newdata = ., type = "response")
+    )
+
+  cv_preds <- dplyr::bind_rows(cv_preds, preds)
+}
+  
+```
+
+## Calculate and Report Error Metrics (MAE, RMSE)
+
+Lower MAE and RMSE indicate better spatial transferability. Look for: (1) the overall means as your headline performance numbers; (2) districts with notably higher errors, which signal where model assumptions or predictors may not capture local structure; and (3) consistency across folds, which suggests stable generalization rather than overfitting to particular districts.
+
+```{r}
+#| label: logo-cv-negbin-metrics
+#| message: false
+#| warning: false
+
+# ---- Calculate & Report Error Metrics (uses `cv_preds`) ----
+
+# Per-district metrics
+cv_results <- cv_preds %>%
+  dplyr::group_by(fold, test_district) %>%
+  dplyr::summarise(
+    n_test      = dplyr::n(),
+    mae_negbin  = mean(abs(y - pred_negbin)),
+    rmse_negbin = sqrt(mean((y - pred_negbin)^2)),
+    .groups = "drop"
+  )
+
+# Overall means
+nb_mean_mae  <- mean(cv_results$mae_negbin)
+nb_mean_rmse <- mean(cv_results$rmse_negbin)
+
+overall_row <- tibble::tibble(
+  fold         = NA_integer_,
+  test_district= "Overall mean",
+  n_test       = sum(cv_results$n_test),
+  mae_negbin   = nb_mean_mae,
+  rmse_negbin  = nb_mean_rmse
+)
+
+cv_table <- dplyr::bind_rows(
+  overall_row,
+  cv_results %>% dplyr::arrange(dplyr::desc(mae_negbin))
+)
+
+knitr::kable(
+  cv_table,
+  digits  = 3,
+  caption = "LOGO CV Results by District and Overall — Negative Binomial (DV = Burglaries)",
+  col.names = c("Fold", "District", "N test", "MAE (NB)", "RMSE (NB)"),
+  booktabs = TRUE
+) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped","hover"),
+    full_width = FALSE
+  )
+
+```
+
+There are a few standout harder to predict districts: District 3 is the clear outlier (MAE 5.68, RMSE 7.19): the model struggles to transfer into this district, likely because its vacancy–burglary relationship or baseline intensity is different from the rest. Districts 7, 11, 12 also post MAE ≈ 3.2–3.6, meaning average errors around three to four incidents per cell. To further understand the problems or causes for these difficult predictions, we'd insepct District 3 (and 7/11/12) for systematic differences: commercial corridors, building stock, guardianship proxies, or reporting patterns.
+
+# KDE-Model Evaluation
+
+## Setting-up KDE
+
+This code block first prepares a kernel density estimate (KDE) of burglary risk and then generates comparable prediction surfaces from both the KDE and the Negative Binomial model. It begins by converting the burglary point data from sf format into a ppp point pattern object (burglaries_ppp) using the Chicago boundary as the observation window. A KDE surface is then computed with a 1 km bandwidth (sigma = 1000), which smooths burglary counts over space while correcting for edge effects. The resultants are converted into a raster, and average KDE values are extracted for each fishnet cell, producing a cell-level variable kde_value that measures historical burglary intensity on the same grid used for modeling.
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+# Convert burglaries to ppp (point pattern) format for spatstat
+burglaries_ppp <- as.ppp(
+  st_coordinates(burglaries),
+  W = as.owin(st_bbox(chicagoBoundary))
+)
+
+# Calculate KDE with 1km bandwidth
+kde_burglaries <- density.ppp(
+  burglaries_ppp,
+  sigma = 1000,  # 1km bandwidth
+  edge = TRUE    # Edge correction
+)
+
+# Convert to terra raster (modern approach, not raster::raster)
+kde_raster <- rast(kde_burglaries)
+
+# Extract KDE values to fishnet cells
+fishnet <- fishnet %>%
+  mutate(
+    kde_value = terra::extract(
+      kde_raster,
+      vect(fishnet),
+      fun = mean,
+      na.rm = TRUE
+    )[, 2]  # Extract just the values column
+  )
+```
+
+## KDE Modeling
+
+A final Negative Binomial model is fitted on the training data using the vacancy measures and ACS controls as predictors. Predictions from this model are then mapped back to the spatial grid (the fishnet). The KDE surface is converted into a comparable prediction by rescaling, which yields a predicted KDE, a pseudo-count prediction that sums to the observed total. We then create, three maps of actual burglaries, Negative Binomial predictions, and KDE predictions. The combined figure provides a direct visual comparison between observed counts and the two competing prediction methods.
+
+```{r}
+# Fit final model on all data
+final_model <- glm.nb(
+    burglaries ~  abandoned_houses + abandoned_houses.nn +     
+      dist_to_hotspot + pct_black + pct_hisp + pct_poverty + 
+      pct_renter + log_income + pct_45_64 + pct_65_plus,
+    data = train_data
+  )
+
+# Add predictions back to fishnet
+fishnet <- fishnet %>%
+  mutate(
+    prediction_nb = predict(final_model, fishnet_model, type = "response")[match(uniqueID, fishnet_model$uniqueID)]
+  )
+
+# Also add KDE predictions (normalize to same scale as counts)
+kde_sum <- sum(fishnet$kde_value, na.rm = TRUE)
+count_sum <- sum(fishnet$burglaries, na.rm = TRUE)
+fishnet <- fishnet %>%
+  mutate(
+    prediction_kde = (kde_value / kde_sum) * count_sum
+  )
+
+# Create three maps
+p1 <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = burglaries), color = NA) +
+  scale_fill_viridis_c(name = "Count", option = "plasma", limits = c(0, 20)) +
+  labs(title = "Actual Burglaries") +
+  plotTheme
+
+p2 <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = prediction_nb), color = NA) +
+  scale_fill_viridis_c(name = "Predicted", option = "plasma", limits = c(0, 20)) +
+  labs(title = "Model Predictions (Neg. Binomial)") +
+  plotTheme
+
+p3 <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = prediction_kde), color = NA) +
+  scale_fill_viridis_c(name = "Predicted", option = "plasma", limits = c(0, 20)) +
+  labs(title = "KDE Baseline Predictions") +
+  plotTheme
+
+p1 + p2 + p3 +
+  plot_annotation(
+    title = "Actual vs. Predicted Burglaries",
+    subtitle = "Does our complex model outperform simple KDE?"
+  )
+
+```
+
+The figure above compares observed burglary counts to predictions from the Negative Binomial model and a KDE baseline. The observed map shows clear spatial concentration: burglaries cluster in a broad corridor across the South and Southwest sides and in parts of the West Side, while much of the North and far Northwest record low or zero counts. At the grid-cell level, this pattern is noisy, with sharp spikes in a few cells adjacent to lower-count neighbors, but the overall structure is one of pronounced spatial clustering rather than uniform risk.
+
+The model-based and KDE prediction surfaces both recover this broad pattern but differ in how they represent risk. The Negative Binomial model, which incorporates vacancy measures and ACS neighborhood characteristics, reproduces the main hot corridors while smoothing out cell-level noise, yielding more coherent patches of elevated risk. In contrast, the KDE baseline produces larger, amorphous “blobs” centered on past burglary locations and offers less differentiation within and around these hot areas. Because KDE relies solely on historical burglary intensity, it cannot highlight structurally vulnerable areas with few past incidents, while the model can assign elevated risk to such locations when vacancy and socioeconomic conditions resemble known hot spots. Overall, the visual comparison suggests that the more complex model provides a sharper and more interpretable risk surface than simple KDE smoothing.
+
+## KDE Model Comparison
+
+This block computes summary performance metrics that quantify how closely each prediction surface matches the observed burglary counts.
+
+```{r model-comparison-metrics}
+# Calculate performance metrics
+comparison <- fishnet %>%
+  st_drop_geometry() %>%
+  filter(!is.na(prediction_nb), !is.na(prediction_kde)) %>%
+  summarize(
+    model_mae = mean(abs(burglaries - prediction_nb)),
+    model_rmse = sqrt(mean((burglaries - prediction_nb)^2)),
+    kde_mae = mean(abs(burglaries - prediction_kde)),
+    kde_rmse = sqrt(mean((burglaries - prediction_kde)^2))
+  )
+
+comparison %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+  separate(metric, into = c("approach", "metric"), sep = "_") %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  kable(
+    digits = 2,
+    caption = "Model Performance Comparison"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+The performance table shows that, when predicting 2017 burglary counts at the grid-cell level, the KDE baseline actually achieves **slightly lower errors** than the vacancy-based model: MAE 2.17 vs. 2.51 and RMSE 3.06 vs. 3.50. In other words, on average the KDE surface is closer to the observed burglary counts, and it makes somewhat fewer large mistakes. This is not surprising given that KDE is essentially a smoothed re-expression of the historical burglary pattern itself; it is designed to fit those data very closely and therefore performs well on this kind of within-year predictive task.
+
+These results temper the earlier, more favorable qualitative impression of the Negative Binomial model. Visually, the model produces a more structured and interpretable risk surface that aligns with vacancy and neighborhood conditions, but that extra structure does not translate into lower error for this particular comparison, if anything, the simple “hotspot from past crimes” approach is modestly more accurate. Substantively, this suggests that for **short-term, same-period prediction**, historical burglary locations remain a very strong predictor and can outperform a more complex model. The added value of the model may lie more in its interpretability and in its potential for **out-of-time generalization** (e.g., to a future year or to emerging hot spots) rather than in raw in-sample predictive accuracy against the 2017 pattern.
+
+## Prediction Errors
+
+This code block examines where each method performs poorly by mapping residuals over space.Two error maps are then created, one for each KDE and Negative Binomial.
+
+```{r prediction-errors}
+#| fig-width: 10
+#| fig-height: 8
+
+# Calculate errors
+fishnet <- fishnet %>%
+  mutate(
+    error_nb     = burglaries - prediction_nb,
+    error_kde    = burglaries - prediction_kde,
+    abs_error_nb = abs(error_nb),
+    abs_error_kde= abs(error_kde)
+  )
+
+# NB model errors
+p1 <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = error_nb), color = NA) +
+  scale_fill_gradient2(
+    name     = "Error (Actual − Predicted)",
+    low      = "#2166ac",
+    mid      = "white",
+    high     = "#b2182b",
+    midpoint = 0,
+    limits   = c(-10, 10)
+  ) +
+  labs(
+    title    = "NB Model Errors",
+    subtitle = "Panel (A)"
+  ) +
+  plotTheme
+
+# KDE errors
+p2 <- ggplot() +
+  geom_sf(data = fishnet, aes(fill = error_kde), color = NA) +
+  scale_fill_gradient2(
+    name     = "Error (Actual − Predicted)",
+    low      = "#2166ac",
+    mid      = "white",
+    high     = "#b2182b",
+    midpoint = 0,
+    limits   = c(-10, 10)
+  ) +
+  labs(
+    title    = "KDE Baseline Errors",
+    subtitle = "Panel (B)"
+  ) +
+  plotTheme
+
+# Combine with shared legend and panel tags
+(p1 + p2) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+```
+
+Panel (A) maps the signed errors for the Negative Binomial model (actual minus predicted burglaries), while Panel (B) does the same for the KDE baseline. In both panels, red cells indicate places where the model **under-predicts** burglaries and blue cells where it **over-predicts**. The mix of red and blue across the city suggests that neither approach has a strong global bias: both overshoot in some neighborhoods and undershoot in others. The largest errors in both maps tend to occur in or near the main burglary corridors on the South, Southwest, and parts of the West Side, which is expected because these are the areas with the highest underlying counts and thus the most room for large discrepancies.
+
+Comparing the two panels, the spatial pattern of errors is broadly similar, but with some subtle differences. The KDE baseline in Panel (B) tends to make larger mistakes right at the cores of historical hot spots, where its smooth kernel surface can either overconcentrate risk or miss micro-level variation along hot-spot edges. The Negative Binomial model in Panel (A) shows a slightly more diffuse pattern of residuals, with errors spread across structurally similar neighborhoods rather than tightly glued to past event locations. This aligns with the numeric evaluation: KDE attains somewhat lower MAE/RMSE overall, but both methods struggle most in the same high-crime corridors. The model’s advantage remains interpretive and structural, tying errors to vacancy and neighborhood context, rather than a clear reduction in spatial prediction error.
+
+# Temporal Validation on 2018 Burglaries
+
+The prediction errors are unexpectedly large, and I was not able, within the scope of this assignment, to identify a convincing explanation. In some cells the model misses on the order of 15–20 burglaries, which is uncomfortably high. One might expect abandoned houses to be only a modest predictor—vacancy is relatively stationary and concentrated in disadvantaged, low-income neighborhoods—but even with that caveat, the deterioration in performance compared with earlier work using similar 2017 data is puzzling. My best guess is that the problem lies less in data coding and more in some combination of model specification choices, the way the training and prediction sets were constructed, and the limits of using 311 calls as a proxy for underlying risk. Because I am not confident that these results are substantively reliable, I treat this section primarily as a demonstration of workflow rather than as a basis for strong inference. The exercise shows how to build and compare spatial versus temporal prediction models.
+
+## Load and Aggregate 2018 Burglaries
+
+This block reads the 2018 crimes CSV, filters to burglary records with valid latitude and longitude, converts them to an sf point layer, reprojects to ESRI:102271, then spatially joins points to the existing 500 m grid and aggregates a per-cell count burglaries_2018. The result is a tidy table of 2018 burglary counts keyed by uniqueID.
+
+```{r}
+#| label: load-2018-tailored
+
+bulgary2018 <- read_csv(here::here("data/crime2018.csv"), show_col_types = FALSE) %>%
+  filter(Year == 2018, !is.na(Latitude), !is.na(Longitude), 
+         stringr::str_detect(toupper(`Primary Type`), "BURGLARY")) %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326) %>%
+  st_transform('ESRI:102271')
+
+burg_2018_fishnet <- bulgary2018 %>%
+  sf::st_join(fishnet, join = sf::st_within) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::group_by(uniqueID) %>%
+  dplyr::summarise(burglaries_2018 = dplyr::n(), .groups = "drop")
+
+```
+
+## Build Prediction Frame and Compute Temporal Metrics
+
+This block attaches the 2018 counts to a copy of the fishnet (leaving the original intact), fills missing counts with zero, and constructs pred_frame_2018 with the same predictors used in 2017 (vacancy features and ACS controls), applying the same transformations (percent to proportion, log income). It then uses your previously selected chosen_model (Negative Binomial) to generate 2018 predictions, and computes overall MAE and RMSE plus by-district MAE and RMSE to quantify temporal generalization.
+
+```{r}
+# keep your original fishnet intact; attach 2018 counts to a copy
+fishnet_2018 <- fishnet %>%
+  dplyr::left_join(burg_2018_fishnet, by = "uniqueID") %>%
+  dplyr::mutate(burglaries_2018 = dplyr::coalesce(burglaries_2018, 0L))
+
+pred_frame_2018 <- fishnet_2018 %>%
+  sf::st_drop_geometry() %>%
+  dplyr::transmute(
+    uniqueID, District,
+    burglaries_2018,                  # 2018 DV for evaluation
+    abandoned_houses,
+    abandoned_houses.nn,
+    dist_to_hotspot,
+    pct_black, pct_hisp, pct_poverty, pct_renter,
+    med_income,
+    pct_45_64, pct_65_plus
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(c(pct_black, pct_hisp, pct_poverty, pct_renter, pct_45_64, pct_65_plus), ~ .x/100),
+    log_income = log(pmax(med_income, 1))
+  ) %>%
+  tidyr::drop_na()
+
+stopifnot(exists("chosen_model"))
+pred_frame_2018 <- pred_frame_2018 %>%
+  dplyr::mutate(pred_2018_nb = stats::predict(chosen_model, newdata = pred_frame_2018, type = "response"))
+
+temporal_overall <- pred_frame_2018 %>%
+  dplyr::summarise(
+    mae_nb  = mean(abs(burglaries_2018 - pred_2018_nb)),
+    rmse_nb = sqrt(mean((burglaries_2018 - pred_2018_nb)^2))
+  )
+
+temporal_by_district <- pred_frame_2018 %>%
+  dplyr::group_by(District) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    mae_nb  = mean(abs(burglaries_2018 - pred_2018_nb)),
+    rmse_nb = sqrt(mean((burglaries_2018 - pred_2018_nb)^2)),
+    .groups = "drop"
+  )
+
+print(temporal_overall)
+
+```
+
+## Report Results and Compare to Spatial Cross-Validation
+
+This block prints a formatted table of the 2018 errors by district and a compact comparison table that lines up the 2017 spatial LOGO averages against the 2018 temporal metrics, so you can see at a glance whether the model transfers better across space or across time.
+
+```{r}
+temporal_by_district %>%
+  dplyr::arrange(dplyr::desc(mae_nb)) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "2018 Temporal Validation by District — NegBin (DV = Burglaries)",
+    col.names = c("District", "N cells", "MAE (NB)", "RMSE (NB)"),
+    booktabs = TRUE
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+
+compare_st <- tibble::tibble(
+  validation = c("Spatial LOGO (2017)", "Temporal (2018)"),
+  MAE  = c(nb_mean_mae,  temporal_overall$mae_nb),
+  RMSE = c(nb_mean_rmse, temporal_overall$rmse_nb)
+)
+
+compare_st %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Spatial (2017 LOGO) vs Temporal (2018) — Negative Binomial"
+  ) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+
+```
+
+## Map Actuals, Predictions, and Errors
+
+This block builds three choropleths over the grid: actual 2018 burglary counts, the model’s 2018 predictions, and the error surface (actual minus predicted). Shown side by side, these maps help diagnose where the model under- or over-predicts when moved forward one year.
+
+```{r}
+#| label: map-2018
+#| fig-width: 10
+#| fig-height: 8
+
+
+fishnet_2018_map <- fishnet %>%
+  dplyr::left_join(pred_frame_2018 %>% dplyr::select(uniqueID, burglaries_2018, pred_2018_nb), by = "uniqueID") %>%
+  dplyr::mutate(error_2018_nb = burglaries_2018 - pred_2018_nb)
+
+p_act <- ggplot() +
+  geom_sf(data = fishnet_2018_map, aes(fill = burglaries_2018), color = NA) +
+  scale_fill_viridis_c(name = "Count", option = "plasma") +
+  labs(title = "Actual Burglaries (2018)") + plotTheme
+
+p_pred <- ggplot() +
+  geom_sf(data = fishnet_2018_map, aes(fill = pred_2018_nb), color = NA) +
+  scale_fill_viridis_c(name = "Predicted", option = "plasma") +
+  labs(title = "Predicted Burglaries (2018, NegBin)") + plotTheme
+
+p_err <- ggplot() +
+  geom_sf(data = fishnet_2018_map, aes(fill = error_2018_nb), color = NA) +
+  scale_fill_gradient2(name = "Error", low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0) +
+  labs(title = "Prediction Error (Actual - Predicted, 2018)") + plotTheme
+
+p_act + p_pred + p_err + patchwork::plot_annotation(title = "Temporal Validation — 2018")
+
+```
+
+------------------------------------------------------------------------

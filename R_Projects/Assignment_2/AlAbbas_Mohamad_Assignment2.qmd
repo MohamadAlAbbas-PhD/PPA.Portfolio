@@ -1,0 +1,1190 @@
+---
+title: "Healthcare Access and Equity in Pennsylvania"
+subtitle: "Spatial Analysis of Vulnerable Population Exposure to Hospital Deserts"
+author: "Mohamad AlAbbas"
+date: today
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+editor: visual
+---
+
+::: {.callout-note appearance="minimal"}
+**Course:** MUSA 5080 — Geospatial Machine Learning for Urban Planning, University of Pennsylvania
+**Portfolio:** [mohamadalabbas-phd.github.io](https://mohamadalabbas-phd.github.io)
+**Summary:** Spatial analysis of hospital access disparities in Pennsylvania, linking ACS demographic data to facility locations to identify census tracts where vulnerable populations face the greatest geographic barriers to care.
+:::
+
+## Part 1: Healthcare Access for Vulnerable Populations
+
+### Research Question
+
+**Which Pennsylvania counties have the highest proportion of vulnerable populations (elderly + low-income) living far from hospitals?**
+
+### Analysis Steps
+
+```{r}
+#| label: Setup
+#| message: true
+#| warning: true
+#| include: false
+#| paged-print: true
+
+# Load required packages
+library(sf)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(tigris)
+library(tidycensus)
+library(knitr)
+library(kableExtra)
+library(tibble)
+library(scales)
+library(RColorBrewer)
+
+census_api_key("807ea1c0820a3e1e46dde3c53438622057fcc1ba")
+
+# ── Visual Themes ─────────────────────────────────────────────────────────────
+plotTheme <- theme(
+  plot.title       = element_text(size = 14, face = "bold"),
+  plot.subtitle    = element_text(size = 11, color = "grey40"),
+  plot.caption     = element_text(size = 8,  color = "grey55", hjust = 1),
+  axis.text        = element_text(size = 9),
+  axis.title       = element_text(size = 10, face = "bold"),
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill = "#fafafa", color = NA),
+  plot.background  = element_rect(fill = "white",   color = NA),
+  legend.title     = element_text(size = 9,  face = "bold"),
+  legend.text      = element_text(size = 8)
+)
+
+mapTheme <- theme_void() +
+  theme(
+    plot.title      = element_text(size = 14, face = "bold"),
+    plot.subtitle   = element_text(size = 11, color = "grey40"),
+    plot.caption    = element_text(size = 8,  color = "grey55", hjust = 1),
+    legend.title    = element_text(size = 9,  face = "bold"),
+    legend.text     = element_text(size = 8),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+palette5 <- c("#f0f9e8", "#bae4bc", "#7bccc4", "#43a2ca", "#0868ac")
+
+# Load spatial data
+pa_counties <- st_read("data/Pennsylvania_County_Boundaries.shp")
+hospitals <- st_read("data/hospitals.geojson")
+census_tracts <- tracts(state = "PA", cb = TRUE)
+
+```
+
+**Checking & Setting CRS:**
+
+```{r}
+#| label: Setting CRS
+#| message: false
+#| warning: false
+#| results: "hide"
+
+# Check that all data loaded correctly
+st_crs(pa_counties)     #WGS 84
+st_crs(hospitals)       #WGS 84
+st_crs(census_tracts)   #NAD 83
+
+#Convert to same projection
+hospitals <- st_transform(hospitals, st_crs(pa_counties))
+census_tracts <- st_transform(census_tracts, st_crs(pa_counties))
+
+```
+
+**Questions to answer:**
+
+- How many hospitals are in your dataset?
+  Answer: 223 Hospitals.
+
+- How many census tracts?
+  Answer: 3,445 census tracts.
+
+- What coordinate reference system is each dataset in?
+  Answer: Both PA counties & Hospitals are in WGS 84, whereas the census tracts are in NAD 83.
+
+---
+
+#### Step 2: Get Demographic Data
+
+**API Call:**
+```{r}
+#| label: Demographic Data
+#| message: false
+#| warning: false
+#| results: "hide" #Remove this to see results of summary table
+
+Demographic_variables <- c(
+  total_pop = "B01003_001",  # Total population
+  medhhinc  = "B19013_001",  # Median household income
+  # Male population by age group (65+)
+  m65_66   = "B01001_020",
+  m67_69   = "B01001_021",
+  m70_74   = "B01001_022",
+  m75_79   = "B01001_023",
+  m80_84   = "B01001_024",
+  m85plus  = "B01001_025",
+  # Female population by age group (65+)
+  f65_66   = "B01001_044",
+  f67_69   = "B01001_045",
+  f70_74   = "B01001_046",
+  f75_79   = "B01001_047",
+  f80_84   = "B01001_048",
+  f85plus  = "B01001_049"
+)
+
+PA_acs <- get_acs(
+  geography = "tract",
+  variables = Demographic_variables,
+  state = "PA",
+  year = 2022,
+  survey = "acs5",
+  output = "wide")
+
+# The `mutate()` function sums the estimates for all male and female
+# age groups aged 65 and above to produce a new variable `pop65plus`.
+
+PA_acs <- PA_acs %>%
+  mutate(pop65plus = (
+    m65_66E + m67_69E + m70_74E + m75_79E + m80_84E + m85plusE +
+    f65_66E + f67_69E + f70_74E + f75_79E + f80_84E + f85plusE
+  ))
+
+# Merge the demographic data (`PA_acs`) with the tract shapefile
+# (`census_tracts`) by the unique GEOID identifier.
+
+PA_tracts <- census_tracts %>%
+  left_join(PA_acs, by = "GEOID")
+
+# income across tracts:
+
+summary(PA_tracts$medhhincE)
+
+
+```
+
+**Questions to answer:**
+
+- What year of ACS data are you using?
+
+  - Answer: 2022
+
+- How many tracts have missing income data?
+
+  - Answer: 62
+
+- What is the median income across all PA census tracts?
+
+  - Answer: 70,188 USD
+
+---
+
+#### Step 3: Vulnerable Populations
+
+**Defining Vulnerability:**
+```{r}
+#| label: Vulnerability Calculations
+#| message: false
+#| warning: false
+#| results: "hide" #Remove this to see results of Kable
+
+# The variable `share65` represents the proportion of the total population
+# aged 65 and older. This will be used to identify tracts with a high
+# concentration of elderly residents.
+
+PA_tracts <- PA_tracts %>%
+  mutate(
+    share65 = pop65plus / total_popE
+  )
+
+
+# Low income: bottom quartile (≤ 25th percentile) of median household income
+# High elderly: top quartile (≥ 75th percentile) of the 65+ share
+
+Inc_threshold <- quantile(PA_tracts$medhhincE, probs = 0.25, na.rm = TRUE)
+age_threshold <- quantile(PA_tracts$share65, probs = 0.75, na.rm = TRUE)
+
+
+# A tract is classified as "vulnerable" if BOTH conditions are met:
+# (1) Median household income is below or equal to the 25th percentile, AND
+# (2) Elderly share is above or equal to the 75th percentile.
+
+PA_tracts <- PA_tracts %>%
+  mutate(
+    low_income = medhhincE <= Inc_threshold,  # Low-income indicator
+    older_pop  = share65 >= age_threshold,    # High-elderly indicator
+    vulnerable = low_income & older_pop       # Combined vulnerability flag
+  )
+
+
+# `n_vuln`: total number of tracts meeting both criteria
+# `pct_vuln`: percentage of all tracts that are vulnerable
+
+n_vuln <- sum(PA_tracts$vulnerable, na.rm = TRUE)
+pct_vuln <- n_vuln / nrow(PA_tracts)
+
+
+# The table reports the income and elderly thresholds used, the number of
+# vulnerable tracts, and their share of all tracts. `scales::dollar()` and
+# `scales::percent()` are used to format the values for readability.
+
+knitr::kable(
+  tibble::tibble(
+    `Income threshold (25th percentile)`        = scales::dollar(as.numeric(Inc_threshold)),
+    `Elderly share threshold (75th percentile)` = scales::percent(as.numeric(age_threshold), accuracy = 0.1),
+    `# Vulnerable tracts`                        = n_vuln,
+    `% of all tracts that are vulnerable`       = scales::percent(pct_vuln, accuracy = 0.1)
+  ),
+  caption = "Vulnerability thresholds and counts (low income + high elderly share)"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+```
+
+**Questions to answer:**
+
+- What income threshold did you choose and why?
+
+  - Answer: Ideally, I would have selected the national U.S. poverty line of `$32,150` as the income cutoff. However, this figure does not accurately reflect relative poverty across regions. For instance, a household earning `$50,000` in New York may still experience financial vulnerability due to local cost-of-living differences.Moreover, because this analysis focuses on elderly populations, income alone may underestimate vulnerability — many older adults have non-income assets or retirement savings that distort what "low income" means within their demographic. Therefore, I use the 25th percentile, `$55,923.50`, of median household income across Pennsylvania census tracts as the cutoff for "low income." This approach casts a wider and more context-sensitive net that captures tracts relatively disadvantaged within the state. Theoretically, tracts with a higher concentration of elderly residents and greater socioeconomic vulnerability are more likely to fall in this bottom income quartile, making it an efficient and justifiable criterion in the absence of more granular wealth data.
+
+- What elderly population threshold did you choose and why?
+
+  - Answer: For the elderly population threshold, I use the 75th percentile of the share of residents aged 65 and older, corresponding to the top quartile of tracts with the highest elderly concentrations. This approach identifies communities where aging populations are most prevalent and likely to face greater service and health-related vulnerabilities. In total
+
+- How many tracts meet your vulnerability criteria?
+
+  - Answer: 164 tracts are considered vulnerable
+
+
+- What percentage of PA census tracts are considered vulnerable by your definition?
+
+  - Answer: 4.8%
+
+---
+
+#### Step 4: Calculate Distance to Hospitals
+
+
+**Distance Calculations:**
+```{r}
+#| label: Hospital Distance Matrix
+#| message: false
+#| warning: false
+#| results: "hide" #Remove this to see results of Kable
+
+
+# Distances are only meaningful in a projected CRS (not WGS84 lon/lat).
+# Using a feet-based CRS lets st_distance() return feet directly.
+# We use the NAD83, 3365 projection designed for Pennsylvania South (ftUS)
+# as the state plane, 3365 is the ideal projection for distance calculations
+pa_proj <- st_transform(pa_counties, 3365)
+hospitals_proj <- st_transform(hospitals, 3365)
+tracts_proj <- st_transform(PA_tracts, 3365)
+
+# Compute polygon centroids AFTER projection. (Safer than doing so in lon/lat.)
+# If you need guaranteed interior points for odd-shaped tracts, consider st_point_on_surface().
+tract_centroids <- tracts_proj %>%
+  st_centroid()
+
+# st_distance() returns an N_tracts x N_hospitals matrix with linear units of the CRS (here: feet).
+dist_matrix <- st_distance(tract_centroids, hospitals_proj)
+
+# Take the minimum across each row (each tract) → nearest hospital distance (feet).
+tract_centroids$nearest_hosp_ft <- apply(dist_matrix, 1, min)
+
+# Also compute miles for easier interpretation.
+tract_centroids <- tract_centroids %>%
+  mutate(nearest_hosp_miles = nearest_hosp_ft / 5280)
+
+PA_tracts <- tracts_proj %>%
+  left_join(
+    tract_centroids %>%
+      st_drop_geometry() %>%
+      select(GEOID, nearest_hosp_miles),
+    by = "GEOID"
+  )
+
+# Average distance to nearest hospital (miles)
+# Maximum distance (miles)
+# Count of tracts farther than 15 miles
+
+vuln_summary <- PA_tracts %>%
+  st_drop_geometry() %>%
+  filter(vulnerable == TRUE) %>%
+  summarize(
+    avg_distance_miles = mean(nearest_hosp_miles, na.rm = TRUE),
+    max_distance_miles = max(nearest_hosp_miles, na.rm = TRUE),
+    tracts_over_15mi = sum(nearest_hosp_miles > 15, na.rm = TRUE)
+  )
+
+knitr::kable(vuln_summary, caption = "Distance to Nearest Hospital (Vulnerable Tracts)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+
+```
+
+**Questions to answer:**
+
+- What is the average distance to the nearest hospital for vulnerable tracts?
+
+  - Answer: 4.74 miles.
+
+- What is the maximum distance?
+
+  - Answer: 19.16 miles.
+
+- How many vulnerable tracts are more than 15 miles from the nearest hospital?
+
+  - Answer: Nine.
+
+---
+
+#### Step 5: Identify Underserved Areas
+
+**Underserved Areas:**
+```{r}
+#| label: Detecting Underserved Areas
+#| message: false
+#| warning: false
+
+# A tract is classified as underserved if it meets BOTH conditions:
+#   (1) It is already marked as "vulnerable" (low income + high elderly share)
+#   (2) It lies more than 15 miles from the nearest hospital
+#
+# This combined condition identifies tracts that are both socioeconomically
+# and spatially disadvantaged in terms of healthcare access.
+
+PA_tracts <- PA_tracts %>%
+  mutate(
+    underserved = vulnerable & nearest_hosp_miles > 15
+  )
+
+# `total_vulnerable`: total number of tracts identified as vulnerable
+# `total_underserved`: number of vulnerable tracts that are also >15 miles away
+# `pct_underserved`: share (%) of vulnerable tracts that are underserved
+
+underserved_summary <- PA_tracts %>%
+  st_drop_geometry() %>%
+  summarize(
+    `Total Vulnerable Tracts`  = sum(vulnerable, na.rm = TRUE),
+    `Total Underserved Tracts` = sum(underserved, na.rm = TRUE),
+    `Percent Underserved (%)`  = round(sum(underserved, na.rm = TRUE) /
+                                       sum(vulnerable, na.rm = TRUE) * 100, 2)
+  )
+
+knitr::kable(
+  underserved_summary,
+  caption = "Underserved Tracts Summary (Vulnerable + >15 miles from Hospital)",
+  align = c("c", "c", "c")
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+
+```
+
+**Questions to answer:**
+
+- How many tracts are underserved?
+
+  - Answer: A total of nine census tracts are classified as underserved, that is, they meet both criteria of being socioeconomically vulnerable and located more than 15 miles from the nearest hospital.
+
+- What percentage of vulnerable tracts are underserved?
+
+  - Answer: These nine tracts represent approximately 5.45 % of all 165 vulnerable tracts identified in the analysis.
+
+- Does this surprise you? Why or why not?
+
+  - Answer: Not particularly. Pennsylvania is known for its dense healthcare network, so it is unsurprising that only a small percentage (5.45%) of vulnerable tracts are geographically isolated. Moreover, elderly individuals tend to gravitate toward areas with better healthcare access, while healthcare conglomerates and hospitals are likewise inclined to locate in regions where their primary patient base already resides. However, even this small cluster of underserved tracts may represent significant service gaps, particularly if these areas contain a high concentration of older residents. It would be worthwhile to examine the racial and age composition of these tracts to assess whether patterns of racial segregation or elderly disenfranchisement contribute to disparities in healthcare accessibility.
+
+---
+
+#### Step 6: Aggregate to County Level
+
+**Demographics of Underserved:**
+```{r}
+#| label: Underserved Demographics
+#| message: false
+#| warning: false
+#| results: "hide" #Remove this to see results of Kable
+
+
+# Spatial join tracts to counties
+
+PA_sjoin <- PA_tracts %>%
+  st_join(pa_proj)
+
+# For each county, compute:
+# Total number of tracts
+# Mean tract area
+# Count of vulnerable and underserved tracts
+# % of vulnerable tracts that are underserved
+# Average distance (mi) to nearest hospital for vulnerable tracts
+# Total elderly population in vulnerable tracts
+
+county_summaries <- PA_sjoin %>%
+  st_drop_geometry() %>%
+  group_by(COUNTY_NAM) %>%
+  summarize(
+    `Number of Tracts`                = n(),
+    `Average Tract Area (sq mi)`      = round(mean(AREA_SQ_MI, na.rm = TRUE), 2),
+    `Vulnerable Tracts`               = sum(vulnerable, na.rm = TRUE),
+    `Underserved Tracts`              = sum(underserved, na.rm = TRUE),
+    `Percent Underserved (%)`         = ifelse(
+      sum(vulnerable, na.rm = TRUE) > 0,
+      round(sum(underserved, na.rm = TRUE) / sum(vulnerable, na.rm = TRUE) * 100, 2),
+      0
+    ),
+    `Avg Dist (mi) - Vulnerable`      = ifelse(
+      sum(vulnerable, na.rm = TRUE) > 0,
+      round(mean(nearest_hosp_miles[vulnerable], na.rm = TRUE), 2),
+      NA_real_
+    ),
+    `Total Vulnerable Pop (65+)`      = ifelse(
+      sum(vulnerable, na.rm = TRUE) > 0,
+      sum(pop65plus[vulnerable], na.rm = TRUE),
+      0
+    )
+  )
+
+# Identify top 5 counties by % underserved
+
+top5_underserved <- county_summaries %>%
+  arrange(desc(`Percent Underserved (%)`),desc(`Total Vulnerable Pop (65+)`)) %>%
+  slice_head(n = 5)
+
+
+knitr::kable(
+  top5_underserved,
+  caption = "Top 5 Counties with Highest Percentage of Underserved Vulnerable Tracts",
+  align = "c"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+```
+
+**Questions to answer:**
+
+- Which 5 counties have the highest percentage of underserved vulnerable tracts?
+
+  - Answer: Bradford, Columbia, Juniata, Monroe, and Perry
+
+- Which counties have the most vulnerable people living far from hospitals?
+
+  - Answer: Perry, Bradford, Juniata, Monroe, and Columbia , in that order.
+
+- Are there any patterns in where underserved counties are located?
+
+  - Answer: They appear to be mostly rural counties, and all five counties appear in PA's MUAs index of underserved areas, so I am confident that the techniques are accurate. Interestingly, all five are white dominant population, but republican which indicates an older generation.
+
+---
+
+#### Step 7: Create Summary Table
+
+**Summary Tabulation:**
+```{r}
+#| label: Priority Counties
+#| message: false
+#| warning: false
+
+# Step 1: Compute a composite priority score
+# Combines percent underserved (severity) × total vulnerable population (scale)
+county_priorities <- county_summaries %>%
+  mutate(
+    priority_score      = (`Percent Underserved (%)` * `Total Vulnerable Pop (65+)`) / 1000,
+    priority_percentile = percent_rank(priority_score) * 100
+  )
+
+# Step 2: Select the top 10 counties by priority score
+top_priority <- county_priorities %>%
+  arrange(desc(priority_score)) %>%
+  slice_head(n = 10) %>%
+  select(
+    County                              = COUNTY_NAM,
+    `# Vulnerable Tracts`               = `Vulnerable Tracts`,
+    `# Underserved Tracts`              = `Underserved Tracts`,
+    `% Underserved`                     = `Percent Underserved (%)`,
+    `Avg. Distance to Hospital (miles)` = `Avg Dist (mi) - Vulnerable`,
+    `Total Vulnerable Population (65+)` = `Total Vulnerable Pop (65+)`,
+    `Priority Score`                    = priority_score,
+    `Percentile Rank`                   = priority_percentile
+  ) %>%
+  mutate(
+    `% Underserved`                     = scales::percent(`% Underserved` / 100, accuracy = 0.1),
+    `Avg. Distance to Hospital (miles)` = round(`Avg. Distance to Hospital (miles)`, 1),
+    `Total Vulnerable Population (65+)` = scales::comma(`Total Vulnerable Population (65+)`, accuracy = 1),
+    `Priority Score`                    = scales::comma(round(`Priority Score`, 0)),
+    `Percentile Rank`                   = scales::percent(`Percentile Rank` / 100, accuracy = 0.1)
+  )
+
+# Step 3: Display formatted table
+knitr::kable(
+  top_priority,
+  caption = "Top 10 Pennsylvania Counties for Healthcare Investment Priority (Vulnerability × Access)",
+  align   = c("l","c","c","c","c","c","c","c"),
+  booktabs = TRUE
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+```
+
+
+---
+
+## Part 2: Comprehensive Visualization
+
+### Map 1: County-Level Choropleth
+
+**County-Level Vulnerability:**
+```{r}
+#| label: Healthcare Challenges
+#| message: false
+#| warning: false
+
+# Create county-level access map
+counties_map <- pa_proj %>%
+  left_join(county_summaries, by = "COUNTY_NAM")
+
+# Map: % of vulnerable tracts underserved + hospitals (with shared legend)
+ggplot() +
+  # County polygons colored by % underserved
+  geom_sf(
+    data = counties_map,
+    aes(fill = `Percent Underserved (%)`),
+    color = "white",
+    size  = 0.2
+  ) +
+  # Hospital points added to legend
+  geom_sf(
+    data  = hospitals_proj,
+    aes(shape = "Hospitals"),     # <— adds to legend
+    color = "darkgreen",
+    size  = 1.5,
+    alpha = 0.8,
+    inherit.aes = FALSE
+  ) +
+  # Continuous viridis fill scale
+  scale_fill_viridis_c(
+    name   = "% of vulnerable tracts underserved",
+    labels = scales::label_number(accuracy = 1, suffix = "%"),
+    limits = c(0, 100),
+    option = "plasma",
+    na.value = "grey90"
+  ) +
+  # Add a manual shape legend for hospitals
+  scale_shape_manual(
+    name   = NULL,
+    values = c("Hospitals" = 16)  # solid circle
+  ) +
+  # Combine legends neatly (fill first, shape second)
+  guides(
+    fill  = guide_colorbar(order = 1, barwidth = 0.7, barheight = 8),
+    shape = guide_legend(order = 2, override.aes = list(size = 3, color = "darkgreen"))
+  ) +
+  labs(
+    title    = "Healthcare Access Challenges Across Pennsylvania",
+    subtitle = "% of vulnerable tracts (low-income & elderly) >15 miles from the nearest hospital",
+    caption  = "Sources: ACS 2018–2022 (tidycensus); PA Counties & Hospitals (course data). Projection: EPSG:3365"
+  ) +
+  coord_sf(datum = NA) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title    = element_text(size = 10, face = "bold"),
+    legend.text     = element_text(size = 9),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 11),
+    plot.caption    = element_text(size = 9)
+  )
+
+```
+
+---
+
+### Map 2: Detailed Vulnerability Map
+
+**Vulnerability Maps:**
+```{r}
+#| label: Tract-Level Vulnerability Map
+#| message: false
+#| warning: false
+
+# 1) Prepare tract status for mapping
+tracts_for_map <- PA_tracts %>%
+  sf::st_transform(3365) %>%
+  dplyr::mutate(
+    tract_status = dplyr::case_when(
+      underserved ~ "Underserved vulnerable",
+      vulnerable  ~ "Vulnerable (≤ 15 mi)",
+      TRUE        ~ "Other tracts"
+    ),
+    tract_status = factor(
+      tract_status,
+      levels = c("Underserved vulnerable", "Vulnerable (≤ 15 mi)", "Other tracts")
+    )
+  )
+
+# 2) Plot with hospitals symbol integrated into legend
+ggplot() +
+  # Background tracts
+  geom_sf(
+    data  = dplyr::filter(tracts_for_map, tract_status == "Other tracts"),
+    fill  = "#F2F2F2", color = NA
+  ) +
+  # Vulnerable but near hospitals
+  geom_sf(
+    data  = dplyr::filter(tracts_for_map, tract_status == "Vulnerable (≤ 15 mi)"),
+    aes(fill = tract_status),
+    color = NA,
+    alpha = 0.9
+  ) +
+  # Underserved vulnerable
+  geom_sf(
+    data  = dplyr::filter(tracts_for_map, tract_status == "Underserved vulnerable"),
+    aes(fill = tract_status),
+    color = NA
+  ) +
+  # County outlines
+  geom_sf(
+    data  = pa_proj,
+    fill  = NA, color = "white", linewidth = 0.4
+  ) +
+  # Hospital locations (added to legend)
+  geom_sf(
+    data = hospitals_proj,
+    aes(shape = "Hospitals"),  # <—— This makes a new legend key for hospitals
+    color = "black",
+    size  = 1.1,
+    alpha = 0.8,
+    inherit.aes = FALSE
+  ) +
+  # Manual fill colors
+  scale_fill_manual(
+    name   = NULL,
+    values = c(
+      "Underserved vulnerable" = "#C0392B",
+      "Vulnerable (≤ 15 mi)"   = "#7F8C8D"
+    ),
+    breaks = c("Underserved vulnerable", "Vulnerable (≤ 15 mi)"),
+    drop   = FALSE
+  ) +
+  # Add legend symbol for hospitals
+  scale_shape_manual(
+    name   = NULL,
+    values = c("Hospitals" = 16)  # solid circle
+  ) +
+  guides(
+    fill  = guide_legend(order = 1, override.aes = list(alpha = 1)),
+    shape = guide_legend(order = 2, override.aes = list(size = 3, color = "black"))
+  ) +
+  labs(
+    title    = "Underserved Vulnerable Census Tracts in Pennsylvania",
+    subtitle = "Tracts with low income & high elderly share located >15 miles from the nearest hospital",
+    caption  = "Sources: ACS 2018–2022 (tidycensus); Course hospitals & PA counties. Projection: EPSG:3365"
+  ) +
+  coord_sf(datum = NA) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title    = element_blank(),
+    legend.text     = element_text(size = 10),
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 11),
+    plot.caption    = element_text(size = 9)
+  )
+
+
+```
+
+---
+
+### Chart: Distribution Analysis
+
+**Figure 1:**
+```{r}
+#| label: Hospital Distance Histogram
+#| message: false
+#| warning: false
+#| fig-cap: "The distribution is heavily left-skewed, with most vulnerable tracts located close to hospitals. Only a few exceed the 15-mile threshold, confirming that long-distance access barriers are rare but geographically distinct."
+
+# --- Prep: tract-level data (vulnerable only) ---
+tract_vuln <- PA_tracts %>%
+  st_drop_geometry() %>%
+  filter(vulnerable == TRUE, !is.na(nearest_hosp_miles))
+
+# --- Histogram: distance distribution among vulnerable tracts ---
+p_hist <- ggplot(tract_vuln, aes(x = nearest_hosp_miles)) +
+  geom_histogram(bins = 30, alpha = 0.8, fill = "gray40") +
+  geom_density(aes(y = after_stat(..count..)), linewidth = 0.8, alpha = 0.4) +
+  geom_vline(xintercept = 15, linewidth = 0.7, linetype = "dashed") +
+  labs(
+    title = "Distance to Nearest Hospital (Vulnerable Tracts)",
+    subtitle = "Dashed line at 15 miles (underserved threshold)",
+    x = "Distance to nearest hospital (miles)",
+    y = "Number of tracts",
+    caption = "Sample: PA tracts flagged as vulnerable (low income & high elderly share)."
+  ) +
+  theme_minimal(base_size = 11)
+
+p_hist
+```
+
+**Figure 2:**
+```{r}
+#| label: Hospital Distance Scatter
+#| message: false
+#| warning: false
+#| fig-cap: "Most vulnerable tracts lie within 10 miles of a hospital, though a few outliers exceed the 15-mile cutoff. Larger elderly populations are not systematically farther away, suggesting that isolation is primarily geographic rather than demographic."
+
+p_scatter <- ggplot(tract_vuln, aes(x = nearest_hosp_miles, y = pop65plus)) +
+  geom_point(alpha = 0.4) +
+  geom_vline(xintercept = 15, linewidth = 0.7, linetype = "dashed") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Distance vs. Size of Vulnerable Population (Tract-Level)",
+    subtitle = "Each point is a vulnerable tract; vertical line marks 15 miles",
+    x = "Distance to nearest hospital (miles)",
+    y = "Vulnerable population (65+)"
+  ) +
+  theme_minimal(base_size = 11)
+
+p_scatter
+```
+
+---
+
+## Part 3: Bring Your Own Data Analysis
+
+### Your Analysis
+
+1. **Loading and Synchronziing Fire/EMS Data with Census Tract**
+
+```{r}
+#| label: Load Station Data
+#| message: false
+#| warning: false
+
+library(sf)
+library(dplyr)
+library(tidyr)
+library(units)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(tidycensus)
+
+# ---- Load data ----
+# Fire/EMS stations (single shapefile)
+stations_raw <- st_read("FIRE_EMS/Fire_and_Emergency_Medical_Service__EMS__Stations_pt.shp", quiet = TRUE)
+
+# Project counties and tracts you already have (from earlier parts)
+stations_proj <- st_transform(stations_raw, 3365)
+pa_proj       <- st_transform(pa_counties, 3365)   # county polygons
+tracts_proj   <- st_transform(PA_tracts, 3365)     # tracts with total_popE
+
+# ---- 1) Dataset description (answers: source/date, features, CRS) ----
+dataset_info <- tibble::tibble(
+  `Dataset`        = "Fire & Emergency Medical Service (EMS) Stations (points)",
+  `Source`         = "Pennsylvania Spatial Data Access (PASDA), Homeland Infrastructure Foundation Level Data HIFLD",
+  `Data vintage`   = "2025",
+  `Feature count`  = nrow(stations_raw),
+  `Geometry type`  = paste(unique(as.character(st_geometry_type(stations_raw))), collapse = ", "),
+  `Original CRS`   = paste0(st_crs(stations_raw)$epsg, " — ", st_crs(stations_raw)$Name),
+  `Analysis CRS`   = paste0("EPSG:3365 — ", st_crs(stations_proj)$Name)
+)
+
+knitr::kable(dataset_info, caption = "Fire/EMS dataset: source, features, and CRS") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+```
+
+**Questions to answer:**
+
+- What dataset did you choose and why?
+
+  - Answer: The Fire & Emergency Medical Service (EMS) Stations point layer for Pennsylvania (single shapefile). It's the right basis to test response coverage—we can buffer stations, apportion population coverage by tract, and compare coverage against population density and minority share.
+
+- What is the data source and date?
+
+  - Answer: Pennsylvania Spatial Data Access (PASDA), Homeland Infrastructure Foundation Level Data HIFLD, for the year 2025.
+
+- How many features does it contain?
+
+  - Answer: 2,591 station points.
+
+- What CRS is it in? Did you need to transform it?
+
+  - Answer: WGS84, transformed to 3365 for spatial calculations.
+
+---
+
+2. **Research question**
+
+Which Pennsylvania tracts are high-priority for Fire/EMS expansion, and where do these gaps overlap with high-minority communities?
+
+---
+
+3. **Spatial analysis**
+
+**Coverage and Equity:**
+```{r}
+#| label: Station Analysis
+#| message: false
+#| warning: false
+
+# What this chunk does:
+#  1) Pulls ACS race (B03002) to compute minority share per tract
+#  2) Builds 2-mile service areas around Fire/EMS stations (EPSG:3365, ftUS)
+#  3) Area-weights tract populations to estimate % population covered vs. uncovered
+#  4) Aggregates key metrics to counties
+#  5) Outputs:
+#     - Statewide table (incl. "% Uncovered that is Minority")
+#     - Equity Table A (Top 10 counties by estimated minority uncovered)
+#     - Tract-level Coverage vs. Density Map (deficit index)
+#     - Tract-level Coverage Equity Map (high-minority + low-coverage)
+#
+# Notes:
+#  - Distance proxy: 2 miles ≈ ~5-min drive (network service areas would be ideal)
+#  - Population coverage is area-weighted at the tract level
+#  - EPSG:3365 (PA South, ftUS) is used for accurate buffering/distances
+
+
+# Pull total population and non-Hispanic White counts at the tract level
+race_vars <- c(total = "B03002_001", white_nonhisp = "B03002_003")
+
+pa_race <- get_acs(
+  geography = "tract",
+  variables = race_vars,
+  state     = "PA",
+  year      = 2022,
+  survey    = "acs5",
+  output    = "wide"
+) %>%
+  transmute(
+    GEOID,
+    total         = totalE,
+    white_nonhisp = white_nonhispE
+  ) %>%
+  mutate(
+    # Count of residents who are NOT non-Hispanic White
+    minority     = pmax(total - white_nonhisp, 0),
+    pct_minority = if_else(total > 0, minority / total * 100, NA_real_)
+  )
+
+# Project counties and tracts to EPSG:3365 and attach race
+pa_proj <- st_transform(pa_counties, 3365)
+tracts_proj <- st_transform(PA_tracts, 3365) %>%
+  left_join(pa_race, by = "GEOID")
+
+
+# Build 2-mile (= 10,560 ft) coverage
+two_miles_ft <- 10560
+
+# Buffer Fire/EMS stations and dissolve into one coverage polygon
+stns_buffer    <- st_buffer(stations_proj, dist = two_miles_ft)
+coverage_union <- st_union(stns_buffer) |> st_as_sf()
+
+# Clip to Pennsylvania extent for clean intersections/plots
+coverage_union <- st_intersection(coverage_union, st_union(pa_proj) |> st_as_sf())
+
+# Compute tract areas in square miles (for density + apportionment)
+tracts_proj$area_mi2 <- as.numeric(set_units(st_area(tracts_proj), "mi^2"))
+
+# Intersect coverage with tracts to get covered sub-areas
+t_cov_parts <- st_intersection(tracts_proj, coverage_union)
+
+# Sum covered area per tract (sq mi)
+t_cov_area <- t_cov_parts %>%
+  mutate(area_cov_mi2 = as.numeric(set_units(st_area(geometry), "mi^2"))) %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(area_cov_mi2 = sum(area_cov_mi2, na.rm = TRUE), .groups = "drop")
+
+# Combine: density, coverage fraction, covered/uncovered population
+tracts_cov <- tracts_proj %>%
+  left_join(t_cov_area, by = "GEOID") %>%
+  mutate(
+    area_cov_mi2  = replace_na(area_cov_mi2, 0),
+    pop           = total_popE,                                # from your earlier ACS pull
+    pop_density   = if_else(area_mi2 > 0, pop / area_mi2, NA_real_),
+    cover_frac    = pmin(1, if_else(area_mi2 > 0, area_cov_mi2 / area_mi2, 0)),
+    pop_cov       = pop * cover_frac,
+    pop_uncovered = pmax(0, pop - pop_cov)
+  ) %>%
+  # Recompute minority fields on THIS object to guarantee availability downstream
+  mutate(
+    minority     = if_else(!is.na(total) & !is.na(white_nonhisp),
+                           pmax(total - white_nonhisp, 0), NA_real_),
+    pct_minority = if_else(!is.na(total) & total > 0,
+                           minority / total * 100, NA_real_)
+  )
+
+
+# Estimate minority share within the uncovered population at the tract level
+tracts_equity <- tracts_cov %>%
+  mutate(
+    minority_share_tr   = if_else(!is.na(total) & total > 0, minority / total, NA_real_),
+    est_uncovered_minor = pop_uncovered * minority_share_tr
+  )
+
+# Compute the statewide row (raw)
+statewide_tbl_raw <- tracts_equity %>%
+  st_drop_geometry() %>%
+  summarise(
+    Total_Population             = sum(pop, na.rm = TRUE),
+    Covered_Population           = sum(pop_cov, na.rm = TRUE),
+    Uncovered_Population         = sum(pop_uncovered, na.rm = TRUE),
+    Estimated_Uncovered_Minority = sum(est_uncovered_minor, na.rm = TRUE),
+    Stations                     = nrow(stations_proj)
+  ) %>%
+  mutate(
+    Pct_Covered                    = Covered_Population   / Total_Population,
+    Pct_Uncovered                  = Uncovered_Population / Total_Population,
+    Pct_Uncovered_That_Is_Minority = if_else(
+      Uncovered_Population > 0,
+      Estimated_Uncovered_Minority / Uncovered_Population,
+      NA_real_
+    )
+  )
+
+# Make a display-friendly, formatted one-row table
+statewide_tbl_display <- statewide_tbl_raw %>%
+  transmute(
+    `Total population`                     = scales::comma(Total_Population),
+    `Covered population`                   = scales::comma(Covered_Population),
+    `Uncovered population`                 = scales::comma(Uncovered_Population),
+    `Estimated uncovered minority`         = scales::comma(Estimated_Uncovered_Minority),
+    `Stations (count)`                     = scales::comma(Stations),
+    `Percent covered`                      = scales::percent(Pct_Covered, accuracy = 0.01),
+    `Percent uncovered`                    = scales::percent(Pct_Uncovered, accuracy = 0.01),
+    `Uncovered that is minority`           = scales::percent(Pct_Uncovered_That_Is_Minority, accuracy = 0.01)
+  )
+
+knitr::kable(
+  statewide_tbl_display,
+  caption = "Statewide coverage & equity (area-weighted, 2-mile buffers)",
+  align   = "c",
+  booktabs = TRUE
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+# Count stations per county for context (optional columns if you want to show later)
+stns_in_county <- st_join(stations_proj, pa_proj, join = st_within)
+county_station_counts <- stns_in_county %>%
+  st_drop_geometry() %>%
+  count(COUNTY_NAM, name = "Stations")
+
+# Aggregate tract metrics to counties
+t2c <- st_join(tracts_equity, pa_proj) %>% st_drop_geometry()
+
+county_equity <- t2c %>%
+  group_by(COUNTY_NAM) %>%
+  summarise(
+    Total_Population             = sum(pop, na.rm = TRUE),
+    Covered_Population           = sum(pop_cov, na.rm = TRUE),
+    Uncovered_Population         = sum(pop_uncovered, na.rm = TRUE),
+    Minority_Population          = sum(minority, na.rm = TRUE),
+    Estimated_Uncovered_Minority = sum(est_uncovered_minor, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(county_station_counts, by = "COUNTY_NAM") %>%
+  mutate(
+    `Percent Covered` = if_else(Total_Population > 0,
+                                Covered_Population / Total_Population * 100, NA_real_)
+  )
+
+# extracting top ten counties with high unocvered minority levels.
+equity_top_abs <- county_equity %>%
+  arrange(desc(Estimated_Uncovered_Minority)) %>%
+  slice_head(n = 10) %>%
+  select(
+    County                          = COUNTY_NAM,
+    `Estimated Minority Uncovered`  = Estimated_Uncovered_Minority,
+    `Total Uncovered`               = Uncovered_Population,
+    `Percent Covered`               = `Percent Covered`,
+    Stations
+  ) %>%
+  mutate(
+    across(c(`Estimated Minority Uncovered`, `Total Uncovered`, Stations), comma),
+    across(c(`Percent Covered`), ~round(.x, 1))
+  )
+
+knitr::kable(
+  equity_top_abs,
+  caption = "Equity Table: Top 10 Counties by Estimated Minority Uncovered Population",
+  align   = "c"
+) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, position = "left")
+
+# Z-score standardization and the "deficiency index"
+# --------------------------------------------------
+# We compare two quantities on different scales:
+#   (1) pop_density_i          = population per square mile in tract i
+#   (2) pct_pop_covered_i      = % of tract i's population within 2 miles of a station
+#
+# To make them comparable, we standardize each with a z-score:
+#   z(x_i) = (x_i − mean(x)) / sd(x), computed across all Pennsylvania tracts.
+# This rescales both variables to unitless, mean-0, sd-1 measures so differences
+# reflect relative position within the statewide distribution (not raw units).
+#
+# Deficiency index (higher = denser but under-covered):
+#   deficiency_i = z(pop_density_i) − z(pct_pop_covered_i)
+# Interpretation:
+#   - Positive : tract is relatively dense given its relatively low coverage
+#                  (potential service gap / higher priority).
+#   - 0        : density and coverage are in balance relative to peers.
+#   - Negative : tract is relatively sparse and/or relatively well covered.
+
+tracts_deficit <- tracts_cov %>%
+  mutate(
+    pct_pop_covered = if_else(pop > 0, (pop_cov / pop) * 100, NA_real_),
+    z_density       = as.numeric(scale(pop_density)),
+    z_coverage      = as.numeric(scale(pct_pop_covered)),
+    deficit_index   = z_density - z_coverage  # higher = dense but poorly covered
+  )
+
+ggplot() +
+  geom_sf(
+    data  = tracts_deficit,
+    aes(fill = deficit_index),
+    color = NA
+  ) +
+  geom_sf(
+    data  = pa_proj,
+    fill  = NA, color = "white", linewidth = 0.25
+  ) +
+  geom_sf(
+    data  = stations_proj,
+    aes(shape = "Fire/EMS stations"),
+    color = "darkgreen", size = 0.9, alpha = 0.85, inherit.aes = FALSE
+  ) +
+  scale_fill_gradient2(
+    name     = "Coverage Deficit Index\n(+ = dense but low coverage)",
+    low      = "#2b83ba", mid = "white", high = "#d7191c",
+    midpoint = 0
+  ) +
+  scale_shape_manual(name = NULL, values = c("Fire/EMS stations" = 16)) +
+  guides(
+    fill  = guide_colorbar(order = 1, barheight = 8),
+    shape = guide_legend(order = 2, override.aes = list(size = 2.2, color = "darkgreen"))
+  ) +
+  labs(
+    title    = "Coverage vs. Density (Tract-Level): Potential Fire/EMS Service Gaps",
+    subtitle = "Index = z(population density) − z(% of tract population within 2 miles of a station)",
+    caption  = "Buffers ≈ 2 miles (EPSG:3365). Coverage apportioned by tract area overlap."
+  ) +
+  coord_sf(datum = NA) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 11),
+    plot.caption    = element_text(size = 9)
+  )
+
+
+# Thresholds: top quartile minority share, bottom quartile coverage
+thr_minority_tr <- quantile(tracts_deficit$pct_minority,     0.75, na.rm = TRUE)
+thr_cover_tr    <- quantile(tracts_deficit$pct_pop_covered, 0.25, na.rm = TRUE)
+
+tracts_equity_tr <- tracts_deficit %>%
+  mutate(
+    high_minority_tr = pct_minority     >= thr_minority_tr,
+    low_cover_tr     = pct_pop_covered  <= thr_cover_tr,
+    flag_both_tr     = high_minority_tr & low_cover_tr
+  )
+
+ggplot() +
+  # Fill by % of tract population covered (easier to interpret than the index)
+  geom_sf(
+    data  = tracts_equity_tr,
+    aes(fill = pct_pop_covered),
+    color = NA
+  ) +
+  # Red outline for tracts meeting BOTH: high-minority AND low-coverage
+  geom_sf(
+    data      = dplyr::filter(tracts_equity_tr, flag_both_tr),
+    fill      = NA,
+    color     = "cyan",
+    linewidth = 0.35
+  ) +
+  geom_sf(
+    data  = pa_proj,
+    fill  = NA, color = "white", linewidth = 0.25
+  ) +
+  geom_sf(
+    data  = stations_proj,
+    aes(shape = "Fire/EMS stations"),
+    color = "darkgreen", size = 0.9, alpha = 0.85, inherit.aes = FALSE
+  ) +
+  scale_fill_viridis_c(
+    name   = "% of tract population within 2 miles",
+    labels = label_number(accuracy = 1, suffix = "%"),
+    option = "plasma",
+    na.value = "grey90"
+  ) +
+  scale_shape_manual(name = NULL, values = c("Fire/EMS stations" = 16)) +
+  guides(
+    fill  = guide_colorbar(order = 1, barheight = 8),
+    shape = guide_legend(order = 2, override.aes = list(size = 2.2, color = "darkgreen"))
+  ) +
+  labs(
+    title    = "Coverage Equity (Tract-Level): Fire/EMS Access in Pennsylvania",
+    subtitle = paste0(
+      "Cyan outline = top 25% minority share (≥ ", round(thr_minority_tr, 1),
+      "%) AND bottom 25% coverage (≤ ", round(thr_cover_tr, 1), "%)"
+    ),
+    caption  = "Minority share: ACS B03002 (2018–2022). Coverage: 2-mile buffers, area-weighted to tracts."
+  ) +
+  coord_sf(datum = NA) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(size = 11),
+    plot.caption    = element_text(size = 9)
+  )
+```
+
+
+**Your interpretation:**
+
+Overall access is high. About 83.6% of residents live within 2 miles of a station; 16.4% (≈2.14M) are outside. Roughly 9.3% of the uncovered statewide are minority (≈198k). Where the gaps concentrate (density vs. coverage map). The largest clusters of dense-but-under-covered tracts appear along the Poconos/Route-80 corridor (Monroe, Pike, parts of Wayne) and in the south-central/exurban belt around Chester, Franklin, Adams, Cumberland, and York. Much of the rural interior is low density with low coverage—but that's not a "deficit" by the index. Equity overlay (tract-level). Cyan-outlined tracts (high-minority + low coverage) are scattered but not widespread. They appear mainly in the Monroe–Pike area and selected exurban tracts in Chester/Lancaster/York. This matches the Top-10 equity table, where Monroe and Chester lead in the absolute number of minority residents outside the 2-mile catchment. Counties to watch. From the equity table: Monroe, Chester, Pike, Lancaster, York (plus Franklin/Cumberland/Adams/Wayne/Centre) combine sizable uncovered totals with notable minority counts—consistent with the map hot spots.
+
+
+## Finally - A few comments about your incorporation of feedback!
+I recieved two comments in the last assignment:
+
+- Hide the setup code block. The Census API key is not supposed to be shared publicly.
+
+  - Action: Setup code blocks were hidden using the quarto functionality.
+
+- If you want to print something, provide a brief explanation. If just for personal reference, print in console (don't need them in markdown)
+
+  - Action: Using the quarto functionality, I prevented auxillary tabulations required for answering certain questions, but not requested by instructions from appear in the markdown, but they remain in the code blocks.
+
+---
+

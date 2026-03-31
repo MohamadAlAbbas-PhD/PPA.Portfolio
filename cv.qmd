@@ -1,0 +1,48 @@
+---
+title: "Curriculum Vitae: Mohamad AlAbbas"
+---
+
+# Mohamad AlAbbas
+
+## Education
+- **PhD in Demography**, University of Pennsylvania, Expected May 2028  
+- **MA in Urban Spatial Analytics**, University of Pennsylvania, Expected May 2027
+- **MA in International Affairs**, Lebanese American University, May 2023 
+- **BE in Electrical Engineering**, Lebanese American University, August 2019  
+
+## Experience
+- **Teaching Assistant**, University of Pennsylvania – Graduate School of Education (2025–2026)  
+  - Lead lab sessions on STATA for Principles of Monitoring and Evaluation, a graduate-level course
+- **Research Assistant**, University of Pennsylvania – PIRE Project (2023–present)  
+  - NSF-funded project on environmental degradation and child development  
+  - Paper: *Born in a Haze* (forest fires & health outcomes in Indonesia)  
+- **Statistical Consultant**, Department of Sociology, University of Pennsylvania (2023–present)  
+  - Support PhD students in Sociology and Demography  
+  - Conduct workshops on machine learning techniques  
+- **Research Intern**, UNDP Office of Audit & Investigations (2022–2023)  
+  - Drafted investigation plans, reports, and conducted interviews  
+- **Research Intern**, Center for International Policy – Technology Policy Program (2022–2023)  
+  - Designed Social Media Harms tracker  
+  - Authored briefs and attended U.S. legislative hearings  
+- **Research Assistant – Individual Contractor**, UN ESCWA (2022)  
+  - Built/improved social demographic database (29% → 83% completion)  
+- **Monitoring & Evaluation Officer**, LAU – Graduate Studies & Research (2019–2021)  
+- **Graduate Teaching Assistant**, LAU – Electrical & Computer Engineering (2019–2021)  
+
+## Fellowships & Awards
+- **Benjamin Franklin Fellowship**, University of Pennsylvania (2024–2028)  
+- **Dean’s Fellowship**, University of Pennsylvania (2023–2024)  
+- **MEPI – Tomorrow’s Leaders Graduate Fellowship**, LAU (2021–2023)  
+- **Outstanding Researcher Award**, LAU (2021)  
+- **Best Presentation Award**, ICIET Japan (2022)  
+
+## Skills
+- **Programming:** R, Python, Stata, Java, Assembly  
+- **Machine Learning:** NLP, RL, Neural Networks (CNN & RNN), Decision Trees  
+- **Software:** Tableau, MATLAB, SPSS, LaTeX  
+- **Languages:** English (Bilingual), Arabic (Native)  
+
+## Contact
+- **Email:** ma96@upenn.edu  
+- **LinkedIn:** [linkedin.com/in/mohammadalabbas96](https://www.linkedin.com/in/mohammadalabbas96)  
+- **ORCID:** [0000-0002-2084-8856](https://orcid.org/0000-0002-2084-8856)  

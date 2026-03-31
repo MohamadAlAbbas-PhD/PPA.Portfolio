@@ -1,0 +1,62 @@
+## Ongoing Research Projects
+
+- **Born in a Haze: Early-life exposure to forest fires and child health in Indonesia**  
+  - Examines impacts of forest fire–related haze on children’s HAZ/WAZ growth indicators using IFLS data.  
+  - Develops clustering algorithms and k-means quintile regression for fire exposure.  
+
+- **Crude Consequences: The Impact of Oil Spills on Child Health and Environmental Vulnerability in Nigeria**  
+  - Integrates MICS data with daily oil spill trackers.  
+  - Explores stratified vulnerability and child health outcomes.  
+
+- **Climate–Health across Biomes: Stratified impacts of precipitation and temperature on children’s health**  
+  - Multi-country analysis of diarrhea, fever, cough, and WHZ outcomes.  
+  - Examines biome interactions with climate anomalies.  
+
+- **Cross-Border Nutritional Vulnerability in Shared Ecologies (India, Bangladesh, Nepal)**  
+  - DHS-based spatial analysis of child undernutrition near borders.  
+  - Tests whether ecological context outweighs political boundaries.  
+
+- **CRAM (Climate-Resilient Access Metric): Healthcare isolation in vulnerable regions**  
+  - Developing an index to measure resilience of healthcare access to climate shocks.  
+  - Focus on flood seasonality and maternal health risks.  
+
+- **Long-Term PM2.5 Exposure and Cardiovascular Disease in Indonesia**  
+  - Cohort-based study using IFLS (2000–2014).  
+  - Models morbidity-adjusted CVD outcomes under cumulative pollution exposure.  
+
+- **Disaster–Health Mediation: Natural disasters as instruments for water contamination**  
+  - Uses IV regression with MICS surveys to assess diarrheal outcomes.  
+  - Explores mediation via healthcare-seeking behaviors and infrastructure.  
+
+---
+
+## In Progress Methodological Work
+
+- **Multistate Life Table Models**  
+  - Transition modeling between Healthy–Unhealthy–Dead states in IFLS morbidity data.  
+  - Replication of Payne et al. (2013) with microsimulation extensions.  
+
+- **Spatial Climate–Health Pipelines**  
+  - Dynamic extraction of precipitation/temperature anomalies via CHIRPS/NOAA rasters.  
+  - Integrating z-scores and climate windows aligned with DHS/MICS survey interviews.  
+
+---
+
+## Publications
+
+1. **Who is exposed and who is harmed? Social disparities in flood exposure and impact in Pernambuco, Brazil** — *Population & Environment* (accepted)  
+2. **Racism, Discrimination, and Scapegoating in the Era of COVID-19** — *IMS Policy and Working Paper Series*
+3. **Environmental Determinants of Migration: Air Pollution in Developing Nations** — IMS Blog – Borders and Limitations (2022)  
+4. **Gender Inequity in Engineering Higher Education: A Case Study of an American University in a Middle Eastern Country** — *ICIET Conference Proceedings* (2022)  
+5. **The Impact of Faculty Scholarly Collaborations with Non-Doctoral Students** — *IEEE IRTM Conference* (2022)  
+6. **The Lebanese Diaspora: From Passive to Retaliatory** — IMS Blog – Borders and Limitations (2022)  
+7. **Quantifying Publisher’s Competence Through Scholarly Engagement** — *Publishing Research Quarterly* (2021)  
+8. **A Case Study of Gender Diversity in a Middle Eastern University** — *IEEE IT-Based Higher Education & Training Conference* (2021)  
+9. **Setting the Boundaries of COVID-19 Lockdown Relaxation Measures** — *Library Hi Tech* (2021)  
+10. **Sustainable Gender Equity Influenced by an Americanized Lebanese Pedagogy** — *World Conference on Women’s Studies* (2021)  
+11. **Toward an Improvement of Engineering Teaming Skills Through an In-House Professionalism Course** — *IEEE Transactions on Education* (2020)  
+12. **Formation of Policies Guided by Multivariable Control Theory** — *Operations Research Perspectives* (2020)  
+13. **The Impact of Collaborative Research: A Case Study in a Developing Country** — *IEEE SMIT Conference* (2020)  
+14. **On the Impact of Multi-Authorship Scholarly Publications** — *IEEE ATMR Conference* (2020)  
+
+

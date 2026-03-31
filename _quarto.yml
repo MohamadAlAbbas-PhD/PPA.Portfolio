@@ -1,0 +1,39 @@
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Mohamad AlAbbas"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - text: About
+        menu: 
+          - href: cv.qmd
+            text: Curriculum Vitae
+          - href: Publications.qmd
+            text: Publications
+      - text: Projects
+        menu: 
+          - href: R_Projects/Assignment_1/assignment1_template.qmd
+            text: "Census Data Quality for Policy Decisions"
+          - href: R_Projects/Assignment_2/AlAbbas_Mohamad_Assignment2.qmd
+            text: "Healthcare Access and Equity in Pennsylvania"
+          - href: R_Projects/Assignment_4/Assignment4.qmd
+            text: "Spatial Predictive Analysis"
+          - href: R_Projects/Assignment_5/assignment5.qmd
+            text: "Space-Time Predictions of Indego Bike Share Demand"
+          - href: R_Projects/midterm/appendix/Midterm_2025.qmd
+            text: "House Pricing - Technical Appendix"
+          - href: R_Projects/Final/final_challenge.qmd
+            text: "Eviction Predictions - Technical Appendix"
+            
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: true
+
+execute:
+  freeze: auto
